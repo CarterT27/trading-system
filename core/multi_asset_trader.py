@@ -507,6 +507,25 @@ class MultiAssetAlpacaTrader:
 
     # ------------------------------------------------------------------ public
 
+    def preload_history(self) -> pd.DataFrame:
+        started = time.monotonic()
+        logger.info(
+            "Preloading history window: symbols=%s lookback=%s",
+            len(self.symbols),
+            self.required_lookback,
+        )
+        panel = self._fetch_market_panel()
+        if panel.empty:
+            logger.warning("Startup preload returned no bars.")
+            return panel
+        self._merge_history(panel)
+        logger.info(
+            "Startup preload complete: rows=%s elapsed=%.1fs",
+            len(panel),
+            time.monotonic() - started,
+        )
+        return panel
+
     def run_once(self) -> Optional[pd.DataFrame]:
         self.iteration_count += 1
         panel = self._fetch_market_panel()

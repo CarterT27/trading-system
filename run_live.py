@@ -277,6 +277,11 @@ Examples:
         help="Cooldown cycles after insufficient buying-power rejects in multi-asset mode (default: 3).",
     )
     parser.add_argument(
+        "--skip-preload",
+        action="store_true",
+        help="Skip startup history preload in multi-asset mode.",
+    )
+    parser.add_argument(
         "--list-strategies",
         action="store_true",
         help="List available strategies and exit",
@@ -440,6 +445,13 @@ def main() -> None:
         )
 
     trade_logger = get_trade_logger()
+
+    if multi_asset_mode and not args.skip_preload:
+        try:
+            trader.preload_history()
+        except Exception as exc:
+            logger.warning("Startup preload failed: %s", exc)
+
     start_equity = trader.starting_equity
     iteration_count = 0
 
