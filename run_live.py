@@ -265,6 +265,18 @@ Examples:
         help="Base backoff seconds between market-data retries in multi-asset mode (default: 0.75).",
     )
     parser.add_argument(
+        "--buying-power-buffer",
+        type=float,
+        default=0.05,
+        help="Fraction of buying power to reserve in multi-asset mode (default: 0.05).",
+    )
+    parser.add_argument(
+        "--buying-power-cooldown-cycles",
+        type=int,
+        default=3,
+        help="Cooldown cycles after insufficient buying-power rejects in multi-asset mode (default: 3).",
+    )
+    parser.add_argument(
         "--list-strategies",
         action="store_true",
         help="List available strategies and exit",
@@ -404,6 +416,8 @@ def main() -> None:
             max_orders_per_cycle=args.max_orders_per_cycle,
             data_fetch_retries=args.data_fetch_retries,
             data_fetch_backoff_seconds=args.data_fetch_backoff,
+            buying_power_buffer=args.buying_power_buffer,
+            buying_power_cooldown_cycles=args.buying_power_cooldown_cycles,
         )
     else:
         logger.info(

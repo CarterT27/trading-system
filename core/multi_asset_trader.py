@@ -68,6 +68,8 @@ class MultiAssetAlpacaTrader:
         max_orders_per_cycle: int = 25,
         data_fetch_retries: int = 3,
         data_fetch_backoff_seconds: float = 0.75,
+        buying_power_buffer: float = 0.05,
+        buying_power_cooldown_cycles: int = 3,
         api: Optional[tradeapi.REST] = None,
     ):
         if not symbols:
@@ -87,6 +89,8 @@ class MultiAssetAlpacaTrader:
         self.max_orders_per_cycle = int(max_orders_per_cycle)
         self.data_fetch_retries = max(1, int(data_fetch_retries))
         self.data_fetch_backoff_seconds = max(0.0, float(data_fetch_backoff_seconds))
+        self.buying_power_buffer = min(max(0.0, float(buying_power_buffer)), 0.50)
+        self.buying_power_cooldown_cycles = max(1, int(buying_power_cooldown_cycles))
 
         self.api = api or get_rest()
         self.rate_limiter = RequestRateLimiter(
@@ -122,6 +126,8 @@ class MultiAssetAlpacaTrader:
         }
 
         self.last_fetch_end: Optional[pd.Timestamp] = None
+        self.iteration_count = 0
+        self.buying_power_cooldown_until: Dict[str, int] = {}
         self.starting_equity = self._get_equity()
         self.latest_equity = self.starting_equity
 
@@ -143,6 +149,16 @@ class MultiAssetAlpacaTrader:
     def _get_equity(self) -> float:
         account = self._api_call(self.api.get_account)
         return float(account.equity)
+
+    def _get_account_snapshot(self) -> tuple[float, float]:
+        account = self._api_call(self.api.get_account)
+        equity = float(getattr(account, "equity", 0.0) or 0.0)
+        buying_power_raw = getattr(account, "buying_power", 0.0)
+        try:
+            buying_power = float(buying_power_raw)
+        except (TypeError, ValueError):
+            buying_power = 0.0
+        return equity, max(0.0, buying_power)
 
     def _data_api_call_with_retries(self, endpoint: str, data: dict) -> dict:
         attempts = self.data_fetch_retries
@@ -453,9 +469,46 @@ class MultiAssetAlpacaTrader:
             return float(fallback.group(1))
         return None
 
+    @staticmethod
+    def _is_insufficient_buying_power_error(exc: Exception) -> bool:
+        return "insufficient buying power" in str(exc).lower()
+
+    @staticmethod
+    def _effective_price(decision: MultiTradeDecision) -> float:
+        if decision.limit_price is not None:
+            return float(decision.limit_price)
+        return float(decision.price)
+
+    def _cap_qty_for_buying_power(
+        self,
+        decision: MultiTradeDecision,
+        position_qty: float,
+        remaining_buying_power: float,
+    ) -> tuple[float, float]:
+        qty = float(int(max(0.0, decision.qty)))
+        price = self._effective_price(decision)
+        if qty <= 0 or price <= 0:
+            return 0.0, 0.0
+
+        affordable_incremental = float(int(max(0.0, remaining_buying_power / price)))
+        if decision.side == "buy":
+            flatten_qty = min(qty, max(0.0, -position_qty))
+        else:
+            flatten_qty = min(qty, max(0.0, position_qty))
+
+        capped_qty = min(qty, flatten_qty + affordable_incremental)
+        capped_qty = float(int(max(0.0, capped_qty)))
+        if capped_qty <= 0:
+            return 0.0, 0.0
+
+        incremental_qty = max(0.0, capped_qty - flatten_qty)
+        reserved_bp = incremental_qty * price
+        return capped_qty, reserved_bp
+
     # ------------------------------------------------------------------ public
 
     def run_once(self) -> Optional[pd.DataFrame]:
+        self.iteration_count += 1
         panel = self._fetch_market_panel()
         if panel.empty:
             logger.debug("No bars returned in this cycle.")
@@ -514,12 +567,39 @@ class MultiAssetAlpacaTrader:
         if not decisions:
             return panel
 
-        decisions.sort(key=lambda d: d.qty * (d.limit_price or d.price), reverse=True)
+        filtered_decisions: List[MultiTradeDecision] = []
+        for decision in decisions:
+            cooldown_until = self.buying_power_cooldown_until.get(decision.symbol, 0)
+            if cooldown_until >= self.iteration_count:
+                logger.debug(
+                    "No trade %s (buying-power cooldown for %s more cycles)",
+                    decision.symbol,
+                    cooldown_until - self.iteration_count + 1,
+                )
+                continue
+            filtered_decisions.append(decision)
+        decisions = filtered_decisions
+        if not decisions:
+            return panel
+
+        def decision_sort_key(decision: MultiTradeDecision) -> tuple[int, float]:
+            position_qty = float(position_map.get(decision.symbol, 0.0))
+            is_position_reducing = (decision.side == "sell" and position_qty > 0) or (
+                decision.side == "buy" and position_qty < 0
+            )
+            notional = decision.qty * self._effective_price(decision)
+            return (0 if is_position_reducing else 1, -notional)
+
+        decisions.sort(key=decision_sort_key)
         if self.max_orders_per_cycle > 0:
             decisions = decisions[: self.max_orders_per_cycle]
 
+        remaining_buying_power = 0.0
         try:
-            self.latest_equity = self._get_equity()
+            self.latest_equity, buying_power = self._get_account_snapshot()
+            remaining_buying_power = max(
+                0.0, buying_power * (1.0 - self.buying_power_buffer)
+            )
         except Exception:
             pass
 
@@ -529,6 +609,12 @@ class MultiAssetAlpacaTrader:
             adjusted_qty = decision.qty
             if decision.side == "sell" and position_qty > 0:
                 adjusted_qty = min(adjusted_qty, float(int(position_qty)))
+
+            adjusted_qty, reserved_buying_power = self._cap_qty_for_buying_power(
+                decision,
+                position_qty,
+                remaining_buying_power,
+            )
             if adjusted_qty <= 0:
                 logger.debug(
                     "No trade %s (insufficient available quantity)", decision.symbol
@@ -572,6 +658,21 @@ class MultiAssetAlpacaTrader:
                         )
                         continue
                 else:
+                    if self._is_insufficient_buying_power_error(exc):
+                        self.buying_power_cooldown_until[order_decision.symbol] = (
+                            self.iteration_count + self.buying_power_cooldown_cycles
+                        )
+                        logger.warning(
+                            "Order rejected for %s: %s (cooldown %s cycles)",
+                            order_decision.symbol,
+                            exc,
+                            self.buying_power_cooldown_cycles,
+                        )
+                        remaining_buying_power = max(
+                            0.0,
+                            remaining_buying_power - reserved_buying_power,
+                        )
+                        continue
                     logger.warning(
                         "Order rejected for %s: %s", order_decision.symbol, exc
                     )
@@ -620,5 +721,15 @@ class MultiAssetAlpacaTrader:
             working_position_map[order_decision.symbol] = (
                 working_position_map.get(order_decision.symbol, 0.0) + signed_qty
             )
+
+            remaining_buying_power = max(
+                0.0,
+                remaining_buying_power - reserved_buying_power,
+            )
+            if order_decision.side == "sell" and position_qty > 0:
+                released_qty = min(order_decision.qty, max(0.0, position_qty))
+                remaining_buying_power += released_qty * self._effective_price(
+                    order_decision
+                )
 
         return panel
