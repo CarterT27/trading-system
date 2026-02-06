@@ -172,6 +172,37 @@ Use the notebooks in `notebooks/`:
 
 They download bars from Alpaca and save raw/clean CSVs to `data/`.
 
+### Build a multi-symbol panel CSV
+For cross-sectional research, use:
+```bash
+python download_panel_data.py --symbols AAPL,MSFT,NVDA,SPY --timeframe 1Min --limit 5000
+```
+
+To resolve tradable symbols directly from Alpaca and save a universe file:
+```bash
+python download_panel_data.py --alpaca-universe --symbols-only --symbols-out data/universe.txt
+```
+
+Optional filters for the Alpaca universe include:
+- `--universe-exchanges NYSE,NASDAQ,ARCA`
+- `--only-shortable`
+- `--only-easy-to-borrow`
+- `--fractionable-only`
+
+Or from a symbols file:
+```bash
+python download_panel_data.py --symbols-file data/universe.txt --timeframe 1Min --start 2025-01-01 --end 2025-01-31
+```
+
+For large universes, set `--start`/`--end` and use batched requests (much faster than one request per symbol):
+```bash
+python download_panel_data.py --symbols-file data/universe.txt --start 2025-01-01 --end 2025-01-31 --batch-size 100
+```
+
+In ranged mode, the downloader paginates automatically until the full time window is fetched.
+
+By default, the downloader enforces a conservative rate limiter (`190 req/min`) to stay below common Alpaca limits (`200 req/min`).
+
 ## Build your own strategy
 Open `strategies/strategy_base.py` and edit `TemplateStrategy` (recommended), or add your own class.
 The backtester expects:
