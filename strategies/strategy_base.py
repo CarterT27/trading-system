@@ -320,13 +320,22 @@ class CrossSectionalPaperReversalStrategy(CrossSectionalStrategy):
             if symbol not in normalized:
                 self.active_positions.pop(symbol, None)
         for symbol, qty in normalized.items():
-            if symbol in self.active_positions:
+            side = 1.0 if qty > 0 else -1.0
+            abs_qty = abs(qty)
+            state = self.active_positions.get(symbol)
+            if state is None:
+                self.active_positions[symbol] = {
+                    "side": side,
+                    "qty": abs_qty,
+                    "bars_left": float(self.hold_minutes),
+                }
                 continue
-            self.active_positions[symbol] = {
-                "side": 1.0 if qty > 0 else -1.0,
-                "qty": abs(qty),
-                "bars_left": float(self.hold_minutes),
-            }
+
+            previous_side = float(np.sign(state.get("side", side)))
+            state["side"] = side
+            state["qty"] = abs_qty
+            if previous_side != side:
+                state["bars_left"] = float(self.hold_minutes)
 
     def run_panel(
         self,

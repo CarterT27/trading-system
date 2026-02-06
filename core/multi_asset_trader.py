@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import re
+import time
 from typing import Callable, Dict, List, Optional
 
 import alpaca_trade_api as tradeapi
@@ -64,6 +66,8 @@ class MultiAssetAlpacaTrader:
         max_api_requests_per_minute: int = 190,
         batch_size: int = 100,
         max_orders_per_cycle: int = 25,
+        data_fetch_retries: int = 3,
+        data_fetch_backoff_seconds: float = 0.75,
         api: Optional[tradeapi.REST] = None,
     ):
         if not symbols:
@@ -81,6 +85,8 @@ class MultiAssetAlpacaTrader:
         )
         self.batch_size = int(batch_size)
         self.max_orders_per_cycle = int(max_orders_per_cycle)
+        self.data_fetch_retries = max(1, int(data_fetch_retries))
+        self.data_fetch_backoff_seconds = max(0.0, float(data_fetch_backoff_seconds))
 
         self.api = api or get_rest()
         self.rate_limiter = RequestRateLimiter(
@@ -138,6 +144,31 @@ class MultiAssetAlpacaTrader:
         account = self._api_call(self.api.get_account)
         return float(account.equity)
 
+    def _data_api_call_with_retries(self, endpoint: str, data: dict) -> dict:
+        attempts = self.data_fetch_retries
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._api_call(
+                    self.api.data_get,
+                    endpoint,
+                    data=data,
+                    feed=self.feed,
+                    api_version="v2",
+                )
+            except Exception as exc:
+                if attempt >= attempts:
+                    raise
+                sleep_for = self.data_fetch_backoff_seconds * attempt
+                logger.warning(
+                    "Data fetch failed (attempt %s/%s): %s; retrying in %.2fs",
+                    attempt,
+                    attempts,
+                    exc,
+                    sleep_for,
+                )
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+
     # ------------------------------------------------------------------ data
 
     def _fetch_batch_bars(
@@ -158,13 +189,7 @@ class MultiAssetAlpacaTrader:
             if page_token:
                 data["page_token"] = page_token
 
-            resp = self._api_call(
-                self.api.data_get,
-                "/stocks/bars",
-                data=data,
-                feed=self.feed,
-                api_version="v2",
-            )
+            resp = self._data_api_call_with_retries("/stocks/bars", data)
             bars_by_symbol = resp.get("bars", {}) if isinstance(resp, dict) else {}
 
             rows: List[dict] = []
@@ -218,7 +243,17 @@ class MultiAssetAlpacaTrader:
         chunks = _chunked(self.symbols, self.batch_size)
         panel_parts: List[pd.DataFrame] = []
         for batch in chunks:
-            batch_df = self._fetch_batch_bars(batch, start=start, end=end)
+            try:
+                batch_df = self._fetch_batch_bars(batch, start=start, end=end)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping batch %s..%s (%s symbols) after repeated fetch errors: %s",
+                    batch[0],
+                    batch[-1],
+                    len(batch),
+                    exc,
+                )
+                continue
             if not batch_df.empty:
                 panel_parts.append(batch_df)
 
@@ -378,6 +413,10 @@ class MultiAssetAlpacaTrader:
         if self.dry_run:
             return "dry_run"
 
+        qty = float(int(max(0.0, decision.qty)))
+        if qty <= 0:
+            raise ValueError("Order quantity must be positive.")
+
         kwargs = {"type": decision.order_type, "time_in_force": "day"}
         if decision.order_type == "limit" and decision.limit_price is not None:
             kwargs["limit_price"] = self._normalize_stock_limit_price(
@@ -387,11 +426,32 @@ class MultiAssetAlpacaTrader:
         order = self._api_call(
             self.api.submit_order,
             symbol=decision.symbol,
-            qty=int(decision.qty),
+            qty=int(qty),
             side=decision.side,
             **kwargs,
         )
         return str(order.id)
+
+    @staticmethod
+    def _extract_available_qty_from_error(exc: Exception) -> Optional[float]:
+        text = str(exc)
+        match = re.search(
+            r"insufficient qty available for order \(requested:\s*([0-9]+(?:\.[0-9]+)?),\s*available:\s*([0-9]+(?:\.[0-9]+)?)\)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return float(match.group(2))
+        if "insufficient qty available" not in text.lower():
+            return None
+        fallback = re.search(
+            r"available:\s*([0-9]+(?:\.[0-9]+)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if fallback:
+            return float(fallback.group(1))
+        return None
 
     # ------------------------------------------------------------------ public
 
@@ -463,25 +523,72 @@ class MultiAssetAlpacaTrader:
         except Exception:
             pass
 
+        working_position_map = dict(position_map)
         for decision in decisions:
-            try:
-                order_id = self._submit_order(decision)
-            except APIError as exc:
-                logger.warning("Order rejected for %s: %s", decision.symbol, exc)
+            position_qty = float(working_position_map.get(decision.symbol, 0.0))
+            adjusted_qty = decision.qty
+            if decision.side == "sell" and position_qty > 0:
+                adjusted_qty = min(adjusted_qty, float(int(position_qty)))
+            if adjusted_qty <= 0:
+                logger.debug(
+                    "No trade %s (insufficient available quantity)", decision.symbol
+                )
                 continue
+            if adjusted_qty != decision.qty:
+                logger.debug(
+                    "Adjusted %s sell qty from %s to %s based on live position.",
+                    decision.symbol,
+                    int(decision.qty),
+                    int(adjusted_qty),
+                )
+            order_decision = replace(decision, qty=adjusted_qty)
+
+            try:
+                order_id = self._submit_order(order_decision)
+            except APIError as exc:
+                available_qty = self._extract_available_qty_from_error(exc)
+                if (
+                    order_decision.side == "sell"
+                    and available_qty is not None
+                    and available_qty > 0
+                    and int(available_qty) < int(order_decision.qty)
+                ):
+                    retry_qty = float(int(available_qty))
+                    retry_decision = replace(order_decision, qty=retry_qty)
+                    logger.warning(
+                        "Order rejected for %s with qty=%s; retrying with available qty=%s",
+                        retry_decision.symbol,
+                        int(order_decision.qty),
+                        int(retry_qty),
+                    )
+                    try:
+                        order_id = self._submit_order(retry_decision)
+                        order_decision = retry_decision
+                    except APIError as retry_exc:
+                        logger.warning(
+                            "Order rejected for %s after qty retry: %s",
+                            retry_decision.symbol,
+                            retry_exc,
+                        )
+                        continue
+                else:
+                    logger.warning(
+                        "Order rejected for %s: %s", order_decision.symbol, exc
+                    )
+                    continue
 
             print_price = (
-                decision.limit_price
-                if decision.limit_price is not None
-                else decision.price
+                order_decision.limit_price
+                if order_decision.limit_price is not None
+                else order_decision.price
             )
             net_pnl = self.latest_equity - self.starting_equity
             self.trade_logger.log_trade(
-                symbol=decision.symbol,
-                side=decision.side,
-                qty=decision.qty,
+                symbol=order_decision.symbol,
+                side=order_decision.side,
+                qty=order_decision.qty,
                 price=print_price,
-                order_type=decision.order_type,
+                order_type=order_decision.order_type,
                 order_id=order_id,
                 status="submitted" if order_id != "dry_run" else "dry_run",
                 equity=self.latest_equity,
@@ -489,18 +596,29 @@ class MultiAssetAlpacaTrader:
                 strategy=(
                     self.portfolio_strategy.__class__.__name__
                     if self.portfolio_strategy is not None
-                    else self.strategy_by_symbol[decision.symbol].__class__.__name__
+                    else self.strategy_by_symbol[
+                        order_decision.symbol
+                    ].__class__.__name__
                 ),
             )
             logger.info(
                 "%s %s %s @ %.2f | order_id=%s | equity=$%.2f | net_pnl=%+.2f",
-                decision.side.upper(),
-                int(decision.qty),
-                decision.symbol,
+                order_decision.side.upper(),
+                int(order_decision.qty),
+                order_decision.symbol,
                 print_price,
                 order_id,
                 self.latest_equity,
                 net_pnl,
+            )
+
+            signed_qty = (
+                order_decision.qty
+                if order_decision.side == "buy"
+                else -order_decision.qty
+            )
+            working_position_map[order_decision.symbol] = (
+                working_position_map.get(order_decision.symbol, 0.0) + signed_qty
             )
 
         return panel

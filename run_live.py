@@ -253,6 +253,18 @@ Examples:
         help="Maximum orders to submit each loop in multi-asset mode (default: 25).",
     )
     parser.add_argument(
+        "--data-fetch-retries",
+        type=int,
+        default=3,
+        help="Retries per failed market-data request in multi-asset mode (default: 3).",
+    )
+    parser.add_argument(
+        "--data-fetch-backoff",
+        type=float,
+        default=0.75,
+        help="Base backoff seconds between market-data retries in multi-asset mode (default: 0.75).",
+    )
+    parser.add_argument(
         "--list-strategies",
         action="store_true",
         help="List available strategies and exit",
@@ -390,6 +402,8 @@ def main() -> None:
             max_api_requests_per_minute=args.max_api_requests_per_minute,
             batch_size=args.batch_size,
             max_orders_per_cycle=args.max_orders_per_cycle,
+            data_fetch_retries=args.data_fetch_retries,
+            data_fetch_backoff_seconds=args.data_fetch_backoff,
         )
     else:
         logger.info(
@@ -479,8 +493,18 @@ def main() -> None:
         )
         try:
             while True:
+                loop_started_at = time.monotonic()
                 handle_iteration()
-                time.sleep(args.sleep)
+                elapsed = time.monotonic() - loop_started_at
+                sleep_for = max(0.0, args.sleep - elapsed)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    logger.warning(
+                        "Iteration took %.1fs which exceeded sleep interval (%ss).",
+                        elapsed,
+                        args.sleep,
+                    )
         except KeyboardInterrupt:
             logger.info("Received stop signal.")
             print_summary()
