@@ -5,3 +5,5 @@
 .env
 logs/
 data/
+notebooks/results/*/*.csv
+notebooks/results/*/*.png
