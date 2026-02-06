@@ -71,6 +71,11 @@ python run_live.py --list-strategies
 python run_live.py --symbol AAPL --strategy ma --live
 ```
 
+### Live trading with debug logs in console
+```bash
+python run_live.py --symbol AAPL --strategy ma --live --debug
+```
+
 ### Cross-sectional live portfolio strategy
 ```bash
 python run_live.py --symbols-file data/universe.txt --strategy cross_sectional_reversal --timeframe 1Min --live --batch-size 100 --max-api-requests-per-minute 190
@@ -99,6 +104,7 @@ python run_live.py --symbol AAPL --strategy template --timeframe 1Min --sleep 5 
 | `--strategy` | ma | Strategy name |
 | `--timeframe` | 1Min | Bar timeframe |
 | `--sleep` | 60 | Seconds between iterations |
+| `--debug` | false | Show DEBUG logs in console during live/dry runs |
 | `--position-size` | 10.0 | Shares (stocks) or USD (crypto) per trade |
 | `--live` | false | Run continuously until Ctrl+C |
 | `--dry-run` | false | Print decisions without placing orders |
@@ -159,6 +165,8 @@ python run_live.py --symbol AAPL --strategy mystrategy --live
 All trades are logged to:
 - `logs/trades.csv` - Trade records (timestamp, symbol, side, qty, price, P&L)
 - `logs/system.log` - Full system log with debug info
+
+Use `--debug` with `run_live.py` if you also want DEBUG lines printed to the terminal in real time.
 
 When you stop with `Ctrl+C`, you'll see a performance summary:
 ```

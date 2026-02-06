@@ -12,6 +12,9 @@ Usage:
     # Continuous live trading
     python run_live.py --symbol AAPL --strategy ma --live
 
+    # Continuous live trading with debug console logs
+    python run_live.py --symbol AAPL --strategy ma --live --debug
+
     # Dry run (no real orders)
     python run_live.py --symbol AAPL --strategy ma --dry-run
 
@@ -31,9 +34,9 @@ import time
 import pandas as pd
 
 from core.alpaca_trader import AlpacaTrader
+from core.logger import get_logger, get_trade_logger, set_console_log_level
 from core.multi_asset_trader import MultiAssetAlpacaTrader
 from core.symbols import resolve_symbols
-from core.logger import get_logger, get_trade_logger
 from pipeline.alpaca import clean_market_data, save_bars
 from strategies import (
     CrossSectionalPaperReversalStrategy,
@@ -57,6 +60,7 @@ Available strategies: {", ".join(list_strategies())}
 
 Examples:
   python run_live.py --symbol AAPL --strategy ma --live
+  python run_live.py --symbol AAPL --strategy ma --live --debug
   python run_live.py --symbol BTCUSD --asset-class crypto --strategy crypto_trend --live
   python run_live.py --symbol AAPL --strategy ma --dry-run --iterations 5
         """,
@@ -215,6 +219,11 @@ Examples:
         "--live", action="store_true", help="Run continuously until Ctrl+C"
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show DEBUG logs in console (system.log always includes DEBUG).",
+    )
+    parser.add_argument(
         "--save-data", action="store_true", help="Save raw+clean CSVs to data/"
     )
     parser.add_argument(
@@ -298,6 +307,10 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
 
 def main() -> None:
     args = parse_args()
+
+    if args.debug:
+        set_console_log_level("DEBUG")
+        logger.info("Console logging set to DEBUG.")
 
     # Handle --list-strategies
     if args.list_strategies:

@@ -18,6 +18,7 @@ LOG_DIR = Path("logs")
 TRADE_LOG_FILE = "trades.csv"
 SIGNAL_LOG_FILE = "signals.csv"
 SYSTEM_LOG_FILE = "system.log"
+_console_log_level = logging.INFO
 
 
 def _ensure_log_dir() -> Path:
@@ -25,21 +26,51 @@ def _ensure_log_dir() -> Path:
     return LOG_DIR
 
 
+def _resolve_log_level(level: int | str) -> int:
+    if isinstance(level, int):
+        return level
+    normalized = str(level).strip().upper()
+    resolved = logging.getLevelName(normalized)
+    if isinstance(resolved, int):
+        return resolved
+    raise ValueError(f"Unknown log level: {level}")
+
+
+def _set_logger_console_level(logger: logging.Logger, level: int) -> None:
+    for handler in logger.handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(
+            handler, logging.FileHandler
+        ):
+            handler.setLevel(level)
+
+
+def set_console_log_level(level: int | str) -> None:
+    """Set console log level for all configured loggers."""
+    global _console_log_level
+    resolved_level = _resolve_log_level(level)
+    _console_log_level = resolved_level
+
+    logger_manager = logging.Logger.manager
+    for logger_obj in logger_manager.loggerDict.values():
+        if isinstance(logger_obj, logging.Logger):
+            _set_logger_console_level(logger_obj, resolved_level)
+
+
 def get_logger(name: str = "trading") -> logging.Logger:
     """Get a configured logger that writes to both console and file."""
     logger = logging.getLogger(name)
 
     if logger.handlers:
+        _set_logger_console_level(logger, _console_log_level)
         return logger
 
     logger.setLevel(logging.DEBUG)
 
     # Console handler
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(_console_log_level)
     console_format = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        "%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
     console_handler.setFormatter(console_format)
     logger.addHandler(console_handler)
@@ -50,7 +81,7 @@ def get_logger(name: str = "trading") -> logging.Logger:
     file_handler.setLevel(logging.DEBUG)
     file_format = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     file_handler.setFormatter(file_format)
     logger.addHandler(file_handler)
@@ -67,8 +98,18 @@ class TradeLogger:
     """
 
     HEADERS = [
-        "timestamp", "symbol", "side", "qty", "price", "order_type",
-        "order_id", "status", "equity", "net_pnl", "strategy", "notes"
+        "timestamp",
+        "symbol",
+        "side",
+        "qty",
+        "price",
+        "order_type",
+        "order_id",
+        "status",
+        "equity",
+        "net_pnl",
+        "strategy",
+        "notes",
     ]
 
     def __init__(self, log_dir: Optional[Path] = None):
@@ -140,14 +181,16 @@ class TradeLogger:
 
         with open(self.signal_file, "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                timestamp,
-                symbol,
-                signal,
-                price,
-                strategy,
-                json.dumps(indicators or {}),
-            ])
+            writer.writerow(
+                [
+                    timestamp,
+                    symbol,
+                    signal,
+                    price,
+                    strategy,
+                    json.dumps(indicators or {}),
+                ]
+            )
 
     def log_skip(
         self,
@@ -206,7 +249,9 @@ class TradeLogger:
         if not trades:
             return empty_result
 
-        executed_trades = [t for t in trades if t["status"] not in ("skipped", "rejected", "none")]
+        executed_trades = [
+            t for t in trades if t["status"] not in ("skipped", "rejected", "none")
+        ]
 
         if not executed_trades:
             return empty_result
@@ -273,7 +318,7 @@ class TradeLogger:
                 pnl = float(t.get("net_pnl", 0) or 0)
                 # For the first trade, compare to 0; for subsequent, compare to previous
                 if i > 0:
-                    prev_pnl = float(executed_trades[i-1].get("net_pnl", 0) or 0)
+                    prev_pnl = float(executed_trades[i - 1].get("net_pnl", 0) or 0)
                     trade_pnl = pnl - prev_pnl
                 else:
                     trade_pnl = pnl
