@@ -217,11 +217,11 @@ class CrossSectionalPaperReversalStrategy(CrossSectionalStrategy):
 
     def __init__(
         self,
-        lookback_minutes: int = 5,
-        hold_minutes: int = 10,
-        tail_quantile: float = 0.02,
-        top_n: int = 2000,
-        liquidity_lookback: int = 390,
+        lookback_minutes: int = 15,
+        hold_minutes: int = 30,
+        tail_quantile: float = 0.016,
+        top_n: int = 600,
+        liquidity_lookback: int = 30,
         min_universe_size: int = 40,
         base_notional_per_name: float = 1_000.0,
         target_annual_vol: float = 0.60,

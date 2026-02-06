@@ -76,7 +76,7 @@ Examples:
     parser.add_argument(
         "--symbols-file",
         default="",
-        help="Path to .txt/.csv symbols file for multi-asset mode.",
+        help="Path to .txt/.csv symbols file for multi-asset mode (cross-sectional defaults to data/universe_long_short.csv if omitted).",
     )
     parser.add_argument(
         "--symbol-limit",
@@ -141,32 +141,32 @@ Examples:
     parser.add_argument(
         "--cs-lookback",
         type=int,
-        default=5,
-        help="Lookback minutes for cross-sectional reversal strategy (default: 5).",
+        default=15,
+        help="Lookback minutes for cross-sectional reversal strategy (default: 15).",
     )
     parser.add_argument(
         "--cs-hold",
         type=int,
-        default=10,
-        help="Holding window in minutes for cross-sectional reversal strategy (default: 10).",
+        default=30,
+        help="Holding window in minutes for cross-sectional reversal strategy (default: 30).",
     )
     parser.add_argument(
         "--cs-tail-quantile",
         type=float,
-        default=0.02,
-        help="Tail quantile for cross-sectional long/short selection (default: 0.02).",
+        default=0.016,
+        help="Tail quantile for cross-sectional long/short selection (default: 0.016).",
     )
     parser.add_argument(
         "--cs-top-n",
         type=int,
-        default=2000,
-        help="Max liquid symbols eligible each rebalance in cross-sectional mode (default: 2000).",
+        default=600,
+        help="Max liquid symbols eligible each rebalance in cross-sectional mode (default: 600).",
     )
     parser.add_argument(
         "--cs-liquidity-lookback",
         type=int,
-        default=390,
-        help="Rolling minutes for ADV/liquidity ranking in cross-sectional mode (default: 390).",
+        default=30,
+        help="Rolling minutes for ADV/liquidity ranking in cross-sectional mode (default: 30).",
     )
     parser.add_argument(
         "--cs-min-universe",
@@ -230,7 +230,9 @@ Examples:
         "--dry-run", action="store_true", help="Print decisions without placing orders"
     )
     parser.add_argument(
-        "--feed", default=None, help="Data feed (iex or sip for stocks)"
+        "--feed",
+        default=None,
+        help="Data feed (iex or sip for stocks; defaults to iex for stocks).",
     )
     parser.add_argument(
         "--batch-size",
@@ -320,6 +322,24 @@ def main() -> None:
         sys.exit(0)
 
     strategy_cls = get_strategy_class(args.strategy)
+
+    if args.asset_class == "stock" and not args.feed:
+        args.feed = "iex"
+        logger.info("No stock feed specified; defaulting to iex.")
+
+    if (
+        strategy_cls is CrossSectionalPaperReversalStrategy
+        and not args.symbols
+        and not args.symbols_file
+    ):
+        default_symbols_file = Path("data/universe_long_short.csv")
+        if default_symbols_file.exists():
+            args.symbols_file = str(default_symbols_file)
+            logger.info(
+                "No symbols provided for cross-sectional strategy; using %s.",
+                args.symbols_file,
+            )
+
     resolved_symbols = resolve_symbols(
         default_symbol=args.symbol,
         symbols_arg=args.symbols,

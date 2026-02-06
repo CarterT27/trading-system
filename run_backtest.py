@@ -214,31 +214,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cs-lookback",
         type=int,
-        default=5,
+        default=15,
         help="Lookback minutes for cross-sectional reversal strategy.",
     )
     parser.add_argument(
         "--cs-hold",
         type=int,
-        default=10,
+        default=30,
         help="Hold window in minutes for cross-sectional reversal strategy.",
     )
     parser.add_argument(
         "--cs-tail-quantile",
         type=float,
-        default=0.02,
+        default=0.016,
         help="Tail quantile for long/short selection in cross-sectional strategy.",
     )
     parser.add_argument(
         "--cs-top-n",
         type=int,
-        default=2000,
+        default=600,
         help="Top liquid symbols eligible per rebalance in cross-sectional strategy.",
     )
     parser.add_argument(
         "--cs-liquidity-lookback",
         type=int,
-        default=390,
+        default=30,
         help="Rolling minute window for liquidity ranking in cross-sectional strategy.",
     )
     parser.add_argument(
