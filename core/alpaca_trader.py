@@ -93,7 +93,9 @@ class AlpacaTrader:
         if max_order_notional is not None:
             self.max_order_notional = float(max_order_notional)
         else:
-            env_value = os.environ.get("ALPACA_MAX_ORDER_NOTIONAL") or os.environ.get("ALPACA_MAX_NOTIONAL")
+            env_value = os.environ.get("ALPACA_MAX_ORDER_NOTIONAL") or os.environ.get(
+                "ALPACA_MAX_NOTIONAL"
+            )
             if env_value:
                 try:
                     self.max_order_notional = float(env_value)
@@ -103,7 +105,9 @@ class AlpacaTrader:
         self.trade_logger = get_trade_logger()
         self.starting_equity = self._get_equity()
 
-        logger.info(f"Initialized trader: {self.display_symbol} | strategy={self.strategy_name} | equity=${self.starting_equity:,.2f}")
+        logger.info(
+            f"Initialized trader: {self.display_symbol} | strategy={self.strategy_name} | equity=${self.starting_equity:,.2f}"
+        )
 
     def _get_equity(self) -> float:
         account = self.api.get_account()
@@ -147,7 +151,14 @@ class AlpacaTrader:
             return f"{qty:.6f}".rstrip("0").rstrip(".")
         return str(int(qty))
 
-    def _build_decision(self, df: pd.DataFrame) -> Tuple[Optional[TradeDecision], Optional[str]]:
+    @staticmethod
+    def _normalize_stock_limit_price(price: float) -> float:
+        decimals = 4 if price < 1.0 else 2
+        return float(f"{price:.{decimals}f}")
+
+    def _build_decision(
+        self, df: pd.DataFrame
+    ) -> Tuple[Optional[TradeDecision], Optional[str]]:
         if df is None or df.empty:
             return None, "no market data returned"
 
@@ -167,6 +178,10 @@ class AlpacaTrader:
 
         limit_value = latest.get("limit_price", None)
         limit_price = float(limit_value) if pd.notna(limit_value) else None
+        if self.asset_class == "stock" and limit_price is not None:
+            limit_price = self._normalize_stock_limit_price(limit_price)
+            if limit_price <= 0:
+                return None, "invalid limit price"
         order_type = "limit" if limit_price is not None else "market"
         price_for_qty = limit_price if limit_price is not None else price
         if price_for_qty <= 0:
@@ -190,7 +205,13 @@ class AlpacaTrader:
         else:
             return None, "no signal from strategy"
         return (
-            TradeDecision(side=side, qty=qty, price=price, order_type=order_type, limit_price=limit_price),
+            TradeDecision(
+                side=side,
+                qty=qty,
+                price=price,
+                order_type=order_type,
+                limit_price=limit_price,
+            ),
             None,
         )
 
@@ -207,7 +228,11 @@ class AlpacaTrader:
             return 0.0, "already short"
 
         # For crypto, don't allow shorting
-        if self.asset_class == "crypto" and decision.side == "sell" and net_position <= 0:
+        if (
+            self.asset_class == "crypto"
+            and decision.side == "sell"
+            and net_position <= 0
+        ):
             return 0.0, "crypto shorting disabled"
 
         if self.asset_class == "stock":
@@ -221,7 +246,9 @@ class AlpacaTrader:
             return qty
         if self.max_order_notional is None:
             return qty
-        price = decision.limit_price if decision.order_type == "limit" else decision.price
+        price = (
+            decision.limit_price if decision.order_type == "limit" else decision.price
+        )
         if price <= 0:
             return qty
         max_qty = self.max_order_notional / price
@@ -237,7 +264,14 @@ class AlpacaTrader:
         tif = "gtc" if self.asset_class == "crypto" else "day"
         order_kwargs = {"type": decision.order_type, "time_in_force": tif}
         if decision.order_type == "limit":
-            order_kwargs["limit_price"] = decision.limit_price
+            limit_price = (
+                float(decision.limit_price)
+                if decision.limit_price is not None
+                else None
+            )
+            if self.asset_class == "stock" and limit_price is not None:
+                limit_price = self._normalize_stock_limit_price(limit_price)
+            order_kwargs["limit_price"] = limit_price
 
         if self.dry_run:
             return "dry_run"
@@ -255,7 +289,9 @@ class AlpacaTrader:
         equity = self._get_equity()
         net_pnl = equity - self.starting_equity
         qty_display = self._format_qty(qty)
-        print_price = decision.limit_price if decision.order_type == "limit" else decision.price
+        print_price = (
+            decision.limit_price if decision.order_type == "limit" else decision.price
+        )
         price_display = f"{print_price:.2f}" if print_price else "market"
 
         # Log to file

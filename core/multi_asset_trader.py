@@ -289,6 +289,11 @@ class MultiAssetAlpacaTrader:
         orders = self._api_call(self.api.list_orders, status="open")
         return {str(getattr(order, "symbol", "")).upper() for order in orders}
 
+    @staticmethod
+    def _normalize_stock_limit_price(price: float) -> float:
+        decimals = 4 if price < 1.0 else 2
+        return float(f"{price:.{decimals}f}")
+
     def _build_decision(
         self, symbol: str, latest: pd.Series, net_position: float
     ) -> tuple[Optional[MultiTradeDecision], Optional[str]]:
@@ -304,6 +309,10 @@ class MultiAssetAlpacaTrader:
 
         limit_value = latest.get("limit_price", None)
         limit_price = float(limit_value) if pd.notna(limit_value) else None
+        if limit_price is not None:
+            limit_price = self._normalize_stock_limit_price(limit_price)
+            if limit_price <= 0:
+                return None, "invalid limit price"
         order_type = "limit" if limit_price is not None else "market"
         price_for_qty = limit_price if limit_price is not None else price
 
@@ -371,7 +380,9 @@ class MultiAssetAlpacaTrader:
 
         kwargs = {"type": decision.order_type, "time_in_force": "day"}
         if decision.order_type == "limit" and decision.limit_price is not None:
-            kwargs["limit_price"] = decision.limit_price
+            kwargs["limit_price"] = self._normalize_stock_limit_price(
+                float(decision.limit_price)
+            )
 
         order = self._api_call(
             self.api.submit_order,
