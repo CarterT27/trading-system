@@ -201,6 +201,11 @@ To resolve tradable symbols directly from Alpaca and save a universe file:
 python download_panel_data.py --alpaca-universe --symbols-only --symbols-out data/universe.txt
 ```
 
+To generate a long/short-ready universe file (shortable + easy-to-borrow):
+```bash
+python download_panel_data.py --alpaca-universe --only-shortable --only-easy-to-borrow --symbols-only --symbols-out data/universe_long_short.csv
+```
+
 Optional filters for the Alpaca universe include:
 - `--universe-exchanges NYSE,NASDAQ,ARCA`
 - `--only-shortable`
