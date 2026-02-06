@@ -18,18 +18,103 @@ import pandas as pd
 from core.backtester import Backtester, PerformanceAnalyzer, plot_equity
 from core.gateway import MarketDataGateway
 from core.matching_engine import MatchingEngine
+from core.multi_asset_backtester import MultiAssetBacktester
 from core.order_book import OrderBook
 from core.order_manager import OrderLoggingGateway, OrderManager
-from strategies import MovingAverageStrategy, TemplateStrategy, get_strategy_class
+from core.symbols import resolve_symbols
+from strategies import (
+    CrossSectionalPaperReversalStrategy,
+    MovingAverageStrategy,
+    TemplateStrategy,
+    get_strategy_class,
+)
 
 
 DATA_DIR = Path("data")
 
 
+def _apply_min_symbol_bars_filter(
+    panel_df: pd.DataFrame,
+    symbol_col: str,
+    min_symbol_bars: int,
+) -> pd.DataFrame:
+    if min_symbol_bars <= 0:
+        return panel_df
+    counts = panel_df.groupby(symbol_col).size()
+    keep = counts[counts >= int(min_symbol_bars)].index
+    keep_list = [str(x).upper() for x in keep.tolist()]
+    symbols = panel_df[symbol_col].astype(str).str.upper()
+    return panel_df[symbols.isin(keep_list)].copy()
+
+
+def _build_auto_liquidity_universe(
+    panel_df: pd.DataFrame,
+    symbol_col: str,
+    top_n: int,
+    min_days: int,
+    max_symbols: int,
+) -> list[str]:
+    if top_n <= 0:
+        return []
+
+    required = {"Datetime", "Close", "Volume", symbol_col}
+    missing = [c for c in required if c not in panel_df.columns]
+    if missing:
+        raise ValueError(
+            f"Liquidity universe filter requires columns {sorted(required)}; missing={missing}"
+        )
+
+    work = panel_df[["Datetime", "Close", "Volume", symbol_col]].copy()
+    work["Datetime"] = pd.to_datetime(work["Datetime"], utc=True, errors="coerce")
+    work = work.dropna(subset=["Datetime", "Close", "Volume", symbol_col]).copy()
+    if work.empty:
+        return []
+
+    work["session_date"] = work["Datetime"].dt.date
+    work["dollar_volume"] = work["Close"].astype(float) * work["Volume"].astype(float)
+
+    daily = (
+        work.groupby(["session_date", symbol_col], as_index=False)["dollar_volume"]
+        .median()
+        .rename(columns={"dollar_volume": "daily_dv_median"})
+    )
+    if daily.empty:
+        return []
+
+    daily["rank"] = daily.groupby("session_date")["daily_dv_median"].rank(
+        ascending=False,
+        method="first",
+    )
+    selected = daily[daily["rank"] <= float(top_n)].copy()
+    if selected.empty:
+        return []
+
+    selected_counts = selected.groupby(symbol_col).size()
+    min_days = max(1, int(min_days))
+    keep_symbols = selected_counts[selected_counts >= min_days].index
+    if len(keep_symbols) == 0:
+        return []
+
+    keep_list = [str(x).upper() for x in keep_symbols.tolist()]
+    scores = (
+        daily[daily[symbol_col].astype(str).str.upper().isin(keep_list)]
+        .groupby(symbol_col)["daily_dv_median"]
+        .median()
+        .sort_values(ascending=False)
+    )
+
+    if max_symbols > 0:
+        scores = scores.head(int(max_symbols))
+
+    return [str(s).upper() for s in scores.index.tolist()]
+
+
 def create_sample_data(path: Path, periods: int = 200) -> None:
     df = pd.DataFrame(
         {
-            "Datetime": pd.date_range(start="2024-01-01 09:30", periods=periods, freq="T"),
+            "Datetime": pd.date_range(
+                start="2024-01-01 09:30", periods=periods, freq="T"
+            ),
             "Open": np.random.uniform(100, 105, periods),
             "High": np.random.uniform(105, 110, periods),
             "Low": np.random.uniform(95, 100, periods),
@@ -43,21 +128,337 @@ def create_sample_data(path: Path, periods: int = 200) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an offline CSV backtest.")
-    parser.add_argument("--csv", type=str, default="", help="Path to a CSV with OHLCV data.")
-    parser.add_argument("--strategy", default="ma", help="Strategy name (ma, template, or a class name).")
-    parser.add_argument("--short-window", type=int, default=20, help="Short MA window (MA strategy).")
-    parser.add_argument("--long-window", type=int, default=60, help="Long MA window (MA strategy).")
-    parser.add_argument("--position-size", type=float, default=10.0, help="Per-trade position size.")
-    parser.add_argument("--momentum-lookback", type=int, default=14, help="Momentum lookback (template).")
-    parser.add_argument("--buy-threshold", type=float, default=0.01, help="Buy threshold (template).")
-    parser.add_argument("--sell-threshold", type=float, default=-0.01, help="Sell threshold (template).")
-    parser.add_argument("--capital", type=float, default=50_000, help="Initial capital.")
-    parser.add_argument("--plot", action="store_true", help="Plot equity curve at the end.")
+    parser.add_argument(
+        "--csv", type=str, default="", help="Path to a CSV with OHLCV data."
+    )
+    parser.add_argument(
+        "--panel-csv",
+        type=str,
+        default="",
+        help="Path to a long-form multi-symbol panel CSV with Datetime,symbol,OHLCV.",
+    )
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default="AAPL",
+        help="Default symbol when not using --symbols/--symbols-file (single-mode).",
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default="",
+        help="Optional comma-separated symbol filter for --panel-csv.",
+    )
+    parser.add_argument(
+        "--symbols-file",
+        type=str,
+        default="",
+        help="Optional .txt/.csv symbol filter file for --panel-csv.",
+    )
+    parser.add_argument(
+        "--symbol-limit",
+        type=int,
+        default=0,
+        help="Optional cap on symbol count in panel mode (0 means all).",
+    )
+    parser.add_argument(
+        "--min-symbol-bars",
+        type=int,
+        default=0,
+        help="Drop symbols with fewer than this many bars in panel mode (0 disables).",
+    )
+    parser.add_argument(
+        "--auto-universe-top-n",
+        type=int,
+        default=0,
+        help="Build dynamic universe from top-N daily median dollar volume (0 disables).",
+    )
+    parser.add_argument(
+        "--auto-universe-min-days",
+        type=int,
+        default=5,
+        help="For auto universe, symbol must appear in top-N for at least this many days.",
+    )
+    parser.add_argument(
+        "--auto-universe-max-symbols",
+        type=int,
+        default=0,
+        help="Optional cap on auto-selected universe size (0 means all passing symbols).",
+    )
+    parser.add_argument(
+        "--strategy",
+        default="ma",
+        help="Strategy name (ma, template, or a class name).",
+    )
+    parser.add_argument(
+        "--short-window", type=int, default=20, help="Short MA window (MA strategy)."
+    )
+    parser.add_argument(
+        "--long-window", type=int, default=60, help="Long MA window (MA strategy)."
+    )
+    parser.add_argument(
+        "--position-size", type=float, default=10.0, help="Per-trade position size."
+    )
+    parser.add_argument(
+        "--momentum-lookback",
+        type=int,
+        default=14,
+        help="Momentum lookback (template).",
+    )
+    parser.add_argument(
+        "--buy-threshold", type=float, default=0.01, help="Buy threshold (template)."
+    )
+    parser.add_argument(
+        "--sell-threshold", type=float, default=-0.01, help="Sell threshold (template)."
+    )
+    parser.add_argument(
+        "--cs-lookback",
+        type=int,
+        default=5,
+        help="Lookback minutes for cross-sectional reversal strategy.",
+    )
+    parser.add_argument(
+        "--cs-hold",
+        type=int,
+        default=10,
+        help="Hold window in minutes for cross-sectional reversal strategy.",
+    )
+    parser.add_argument(
+        "--cs-tail-quantile",
+        type=float,
+        default=0.02,
+        help="Tail quantile for long/short selection in cross-sectional strategy.",
+    )
+    parser.add_argument(
+        "--cs-top-n",
+        type=int,
+        default=2000,
+        help="Top liquid symbols eligible per rebalance in cross-sectional strategy.",
+    )
+    parser.add_argument(
+        "--cs-liquidity-lookback",
+        type=int,
+        default=390,
+        help="Rolling minute window for liquidity ranking in cross-sectional strategy.",
+    )
+    parser.add_argument(
+        "--cs-min-universe",
+        type=int,
+        default=40,
+        help="Minimum eligible symbols before cross-sectional strategy trades.",
+    )
+    parser.add_argument(
+        "--cs-base-notional",
+        type=float,
+        default=1000.0,
+        help="Base dollar notional per symbol before leverage in cross-sectional strategy.",
+    )
+    parser.add_argument(
+        "--cs-target-annual-vol",
+        type=float,
+        default=0.60,
+        help="Target annual vol for cross-sectional leverage sizing; 0 disables.",
+    )
+    parser.add_argument(
+        "--cs-vol-window",
+        type=int,
+        default=60,
+        help="Rolling window for cross-sectional volatility proxy.",
+    )
+    parser.add_argument(
+        "--cs-max-leverage",
+        type=float,
+        default=10.0,
+        help="Max leverage for cross-sectional strategy.",
+    )
+    parser.add_argument(
+        "--cs-min-annual-vol",
+        type=float,
+        default=0.01,
+        help="Vol floor for cross-sectional leverage calculation.",
+    )
+    parser.add_argument(
+        "--cs-no-flips",
+        action="store_true",
+        help="Disable immediate side flips in cross-sectional strategy.",
+    )
+    parser.add_argument(
+        "--capital", type=float, default=50_000, help="Initial capital."
+    )
+    parser.add_argument(
+        "--plot", action="store_true", help="Plot equity curve at the end."
+    )
     return parser.parse_args()
+
+
+def build_strategy(strategy_cls, args: argparse.Namespace):
+    if strategy_cls is MovingAverageStrategy:
+        return MovingAverageStrategy(
+            short_window=args.short_window,
+            long_window=args.long_window,
+            position_size=args.position_size,
+        )
+    if strategy_cls is TemplateStrategy:
+        return TemplateStrategy(
+            lookback=args.momentum_lookback,
+            position_size=args.position_size,
+            buy_threshold=args.buy_threshold,
+            sell_threshold=args.sell_threshold,
+        )
+    if strategy_cls is CrossSectionalPaperReversalStrategy:
+        return CrossSectionalPaperReversalStrategy(
+            lookback_minutes=args.cs_lookback,
+            hold_minutes=args.cs_hold,
+            tail_quantile=args.cs_tail_quantile,
+            top_n=args.cs_top_n,
+            liquidity_lookback=args.cs_liquidity_lookback,
+            min_universe_size=args.cs_min_universe,
+            base_notional_per_name=args.cs_base_notional,
+            target_annual_vol=args.cs_target_annual_vol,
+            volatility_window=args.cs_vol_window,
+            max_leverage=args.cs_max_leverage,
+            min_annual_vol=args.cs_min_annual_vol,
+            allow_flips=not args.cs_no_flips,
+        )
+    try:
+        return strategy_cls()
+    except TypeError as exc:
+        raise SystemExit(
+            f"{strategy_cls.__name__} must support a no-arg constructor or use --strategy template."
+        ) from exc
 
 
 def main() -> None:
     args = parse_args()
+
+    strategy_cls = get_strategy_class(args.strategy)
+    strategy_probe = build_strategy(strategy_cls, args)
+    is_cross_sectional = hasattr(strategy_probe, "run_panel")
+
+    if is_cross_sectional and not args.panel_csv:
+        raise SystemExit(
+            "Cross-sectional strategies require --panel-csv (multi-symbol long-form data)."
+        )
+
+    if args.panel_csv:
+        panel_path = Path(args.panel_csv)
+        if not panel_path.exists():
+            raise FileNotFoundError(f"Panel CSV not found: {panel_path}")
+
+        panel_df = pd.read_csv(panel_path)
+        sym_col = "symbol"
+        user_specified_symbols = bool(
+            args.symbols or args.symbols_file or args.symbol_limit > 0
+        )
+        symbols = []
+        if user_specified_symbols:
+            symbols = resolve_symbols(
+                default_symbol=args.symbol,
+                symbols_arg=args.symbols,
+                symbols_file_arg=args.symbols_file,
+                symbol_limit=args.symbol_limit,
+            )
+
+        if symbols:
+            panel_df.columns = [str(c) for c in panel_df.columns]
+            found_sym_col = None
+            for col in panel_df.columns:
+                if str(col).strip().lower() in {"symbol", "ticker"}:
+                    found_sym_col = col
+                    break
+            if found_sym_col is None:
+                raise ValueError("Panel CSV must contain a symbol column.")
+            sym_col = str(found_sym_col)
+            panel_df[sym_col] = panel_df[sym_col].astype(str).str.upper()
+            panel_df = panel_df[panel_df[sym_col].isin(list(symbols))].copy()
+        else:
+            panel_df.columns = [str(c) for c in panel_df.columns]
+            for col in panel_df.columns:
+                if str(col).strip().lower() in {"symbol", "ticker"}:
+                    sym_col = str(col)
+                    break
+        if panel_df.empty:
+            raise RuntimeError("Filtered panel data is empty.")
+
+        before_symbols = int(panel_df[sym_col].nunique())
+        before_rows = len(panel_df)
+        panel_df = _apply_min_symbol_bars_filter(
+            panel_df,
+            symbol_col=sym_col,
+            min_symbol_bars=args.min_symbol_bars,
+        )
+
+        if args.auto_universe_top_n > 0 and not panel_df.empty:
+            auto_symbols = _build_auto_liquidity_universe(
+                panel_df,
+                symbol_col=sym_col,
+                top_n=args.auto_universe_top_n,
+                min_days=args.auto_universe_min_days,
+                max_symbols=args.auto_universe_max_symbols,
+            )
+            if not auto_symbols:
+                raise RuntimeError(
+                    "Auto liquidity universe filter returned zero symbols. "
+                    "Try lowering --auto-universe-top-n or --auto-universe-min-days."
+                )
+            panel_df[sym_col] = panel_df[sym_col].astype(str).str.upper()
+            panel_df = panel_df[panel_df[sym_col].isin(list(auto_symbols))].copy()
+
+        panel_df = pd.DataFrame(panel_df)
+        after_symbols = int(panel_df[sym_col].nunique())
+        after_rows = len(panel_df)
+
+        if panel_df.empty:
+            raise RuntimeError("Panel data is empty after quality/universe filters.")
+
+        if before_symbols != after_symbols or before_rows != after_rows:
+            print(
+                "Panel filter summary: "
+                f"symbols {before_symbols} -> {after_symbols}, "
+                f"rows {before_rows} -> {after_rows}"
+            )
+
+        def strategy_factory():
+            return build_strategy(strategy_cls, args)
+
+        multi_bt = MultiAssetBacktester(
+            panel_df=panel_df,
+            strategy_factory=strategy_factory,
+            initial_capital=args.capital,
+        )
+        interrupted = False
+        try:
+            equity_df = multi_bt.run()
+        except KeyboardInterrupt:
+            interrupted = True
+            equity_df = multi_bt.equity_frame()
+            print("\nBacktest interrupted. Showing partial results...")
+
+        if equity_df.empty:
+            raise RuntimeError("No equity points produced in multi-asset backtest.")
+
+        returns = equity_df["equity"].pct_change().fillna(0.0)
+        sharpe = 0.0
+        if returns.std() > 0:
+            sharpe = float(np.sqrt(252 * 6.5 * 60) * returns.mean() / returns.std())
+        drawdown = (equity_df["equity"] / equity_df["equity"].cummax() - 1.0).min()
+
+        title = "=== Multi-Asset Backtest Summary ==="
+        if interrupted:
+            title = "=== Multi-Asset Backtest Summary (Partial) ==="
+        print(f"\n{title}")
+        symbols_traded = int(pd.Series(panel_df[sym_col]).nunique())
+        print(f"Symbols traded: {symbols_traded}")
+        print(f"Equity data points: {len(equity_df)}")
+        print(f"Trades executed: {len(multi_bt.trades)}")
+        print(f"Final portfolio value: {equity_df.iloc[-1]['equity']:.2f}")
+        print(f"PnL: {equity_df.iloc[-1]['equity'] - equity_df.iloc[0]['equity']:.2f}")
+        print(f"Sharpe: {sharpe:.2f}")
+        print(f"Max Drawdown: {float(drawdown):.4f}")
+
+        if args.plot:
+            plot_equity(equity_df)
+        return
 
     csv_path = Path(args.csv) if args.csv else DATA_DIR / "sample_system_test_data.csv"
     if not csv_path.exists():
@@ -66,31 +467,12 @@ def main() -> None:
         create_sample_data(csv_path)
         print(f"Sample data generated at {csv_path}.")
 
-    strategy_cls = get_strategy_class(args.strategy)
-    if strategy_cls is MovingAverageStrategy:
-        strategy = MovingAverageStrategy(
-            short_window=args.short_window,
-            long_window=args.long_window,
-            position_size=args.position_size,
-        )
-    elif strategy_cls is TemplateStrategy:
-        strategy = TemplateStrategy(
-            lookback=args.momentum_lookback,
-            position_size=args.position_size,
-            buy_threshold=args.buy_threshold,
-            sell_threshold=args.sell_threshold,
-        )
-    else:
-        try:
-            strategy = strategy_cls()
-        except TypeError as exc:
-            raise SystemExit(
-                f"{strategy_cls.__name__} must support a no-arg constructor or use --strategy template."
-            ) from exc
-
+    strategy = strategy_probe
     gateway = MarketDataGateway(csv_path)
     order_book = OrderBook()
-    order_manager = OrderManager(capital=args.capital, max_long_position=1_000, max_short_position=1_000)
+    order_manager = OrderManager(
+        capital=args.capital, max_long_position=1_000, max_short_position=1_000
+    )
     matching_engine = MatchingEngine()
     logger = OrderLoggingGateway()
 
@@ -104,10 +486,35 @@ def main() -> None:
         default_position_size=int(max(1, args.position_size)),
     )
 
-    equity_df = backtester.run()
+    interrupted = False
+    try:
+        equity_df = backtester.run()
+    except KeyboardInterrupt:
+        interrupted = True
+        points = min(len(backtester.market_history), len(backtester.equity_curve))
+        timestamps = [
+            pd.Timestamp(backtester.market_history[i]["Datetime"])
+            for i in range(points)
+        ]
+        equity_df = pd.DataFrame(
+            {
+                "Datetime": timestamps,
+                "equity": backtester.equity_curve[:points],
+                "cash": backtester.cash_history[:points],
+                "position": backtester.position_history[:points],
+            }
+        )
+        print("\nBacktest interrupted. Showing partial results...")
+
+    if equity_df.empty:
+        raise RuntimeError("No equity points produced in backtest.")
+
     analyzer = PerformanceAnalyzer(equity_df["equity"].tolist(), backtester.trades)
 
-    print("\n=== Backtest Summary ===")
+    title = "=== Backtest Summary ==="
+    if interrupted:
+        title = "=== Backtest Summary (Partial) ==="
+    print(f"\n{title}")
     print(f"Equity data points: {len(equity_df)}")
     print(f"Trades executed: {sum(1 for t in backtester.trades if t.qty > 0)}")
     print(f"Final portfolio value: {equity_df.iloc[-1]['equity']:.2f}")

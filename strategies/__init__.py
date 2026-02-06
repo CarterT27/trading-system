@@ -7,6 +7,8 @@ from typing import Dict, Type
 
 from . import strategy_base
 from .strategy_base import (
+    CrossSectionalPaperReversalStrategy,
+    CrossSectionalStrategy,
     CryptoTrendStrategy,
     DemoStrategy,
     MovingAverageStrategy,
@@ -15,23 +17,34 @@ from .strategy_base import (
 )
 
 
+_BUILTIN_STRATEGIES: Dict[str, Type[Strategy]] = {
+    "ma": MovingAverageStrategy,
+    "moving_average": MovingAverageStrategy,
+    "template": TemplateStrategy,
+    "student": TemplateStrategy,
+    "crypto_trend": CryptoTrendStrategy,
+    "crypto": CryptoTrendStrategy,
+    "demo": DemoStrategy,
+    "cross_sectional_reversal": CrossSectionalPaperReversalStrategy,
+}
+
+_BUILTIN_CLASSES = {
+    MovingAverageStrategy,
+    TemplateStrategy,
+    CryptoTrendStrategy,
+    DemoStrategy,
+    CrossSectionalPaperReversalStrategy,
+}
+
+
 def _build_registry() -> Dict[str, Type[Strategy]]:
-    registry: Dict[str, Type[Strategy]] = {}
+    registry: Dict[str, Type[Strategy]] = dict(_BUILTIN_STRATEGIES)
     for name, obj in inspect.getmembers(strategy_base, inspect.isclass):
-        if obj is Strategy:
+        if obj in {Strategy, CrossSectionalStrategy}:
             continue
         if issubclass(obj, Strategy) and obj.__module__ == strategy_base.__name__:
-            registry[name.lower()] = obj
-
-    registry.setdefault("ma", MovingAverageStrategy)
-    registry.setdefault("moving_average", MovingAverageStrategy)
-    registry.setdefault("template", TemplateStrategy)
-    registry.setdefault("student", TemplateStrategy)
-    registry.setdefault("crypto", CryptoTrendStrategy)
-    registry.setdefault("crypto_trend", CryptoTrendStrategy)
-    registry.setdefault("crypto_trend_ema", CryptoTrendStrategy)
-    registry.setdefault("demo", DemoStrategy)
-    registry.setdefault("fast", DemoStrategy)
+            if obj not in _BUILTIN_CLASSES:
+                registry[name.lower()] = obj
     return registry
 
 
@@ -49,12 +62,15 @@ def get_strategy_class(name: str) -> Type[Strategy]:
 
 
 def list_strategies() -> list[str]:
-    return sorted(_REGISTRY.keys())
+    custom = sorted(k for k in _REGISTRY.keys() if k not in _BUILTIN_STRATEGIES)
+    return sorted(_BUILTIN_STRATEGIES.keys()) + custom
 
 
 __all__ = [
     "Strategy",
     "TemplateStrategy",
+    "CrossSectionalStrategy",
+    "CrossSectionalPaperReversalStrategy",
     "MovingAverageStrategy",
     "CryptoTrendStrategy",
     "DemoStrategy",

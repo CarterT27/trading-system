@@ -1,5 +1,7 @@
 # Trading System
 
+![](https://media1.tenor.com/m/JAJEdIBuT_gAAAAC/diegopatricio-patricio.gif)
+
 ## What this includes
 - Alpaca paper-data download + cleaning helpers
 - A paper-trading runner that submits orders through Alpaca
@@ -9,6 +11,7 @@
   - **MovingAverageStrategy** (`ma`) - Simple moving average crossover
   - **TemplateStrategy** (`template`) - Momentum-based starter template
   - **CryptoTrendStrategy** (`crypto_trend`) - EMA trend follower for crypto (long-only)
+  - **CrossSectionalPaperReversalStrategy** (`cross_sectional_reversal`) - Multi-symbol long/short intraday reversal portfolio strategy
 
 ## Quick Start
 
@@ -68,6 +71,11 @@ python run_live.py --list-strategies
 python run_live.py --symbol AAPL --strategy ma --live
 ```
 
+### Cross-sectional live portfolio strategy
+```bash
+python run_live.py --symbols-file data/universe.txt --strategy cross_sectional_reversal --timeframe 1Min --live --batch-size 100 --max-api-requests-per-minute 190
+```
+
 ### Dry run (no real orders)
 ```bash
 python run_live.py --symbol AAPL --strategy ma --dry-run --iterations 10
@@ -102,6 +110,16 @@ python run_live.py --symbol AAPL --strategy template --timeframe 1Min --sleep 5 
 
 ```bash
 python run_backtest.py --csv data/AAPL_1Min_stock_alpaca_clean.csv --strategy ma --plot
+```
+
+Multi-asset backtest from panel data:
+```bash
+python run_backtest.py --panel-csv data/panels/us_equities_1min_panel.csv --symbols-file data/universe.txt --strategy cross_sectional_reversal
+```
+
+Cross-sectional portfolio backtest from panel data:
+```bash
+python run_backtest.py --panel-csv data/panels/us_equities_1min_panel.csv --symbols-file data/universe.txt --strategy cross_sectional_reversal
 ```
 
 ---

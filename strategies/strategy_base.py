@@ -50,11 +50,15 @@ class Strategy:
         - signal, target_qty, position (output from generate_signals)
     """
 
-    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:  # pragma: no cover - interface
+    def add_indicators(
+        self, df: pd.DataFrame
+    ) -> pd.DataFrame:  # pragma: no cover - interface
         """Add technical indicators to the DataFrame. Override this method."""
         raise NotImplementedError
 
-    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:  # pragma: no cover - interface
+    def generate_signals(
+        self, df: pd.DataFrame
+    ) -> pd.DataFrame:  # pragma: no cover - interface
         """Generate trading signals. Override this method."""
         raise NotImplementedError
 
@@ -66,12 +70,31 @@ class Strategy:
         return df
 
 
+class CrossSectionalStrategy(Strategy):
+    """Base class for portfolio strategies that operate on symbol panels."""
+
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
+
+    def run_panel(
+        self,
+        panel_df: pd.DataFrame,
+        current_positions: dict[str, float] | None = None,
+    ) -> pd.DataFrame:
+        raise NotImplementedError
+
+
 class MovingAverageStrategy(Strategy):
     """
     Moving average crossover strategy with explicitly defined entry/exit rules.
     """
 
-    def __init__(self, short_window: int = 20, long_window: int = 60, position_size: float = 10.0):
+    def __init__(
+        self, short_window: int = 20, long_window: int = 60, position_size: float = 10.0
+    ):
         if short_window >= long_window:
             raise ValueError("short_window must be strictly less than long_window.")
         if position_size <= 0:
@@ -90,8 +113,12 @@ class MovingAverageStrategy(Strategy):
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
         df["signal"] = 0
 
-        buy = (df["MA_short"].shift(1) <= df["MA_long"].shift(1)) & (df["MA_short"] > df["MA_long"])
-        sell = (df["MA_short"].shift(1) >= df["MA_long"].shift(1)) & (df["MA_short"] < df["MA_long"])
+        buy = (df["MA_short"].shift(1) <= df["MA_long"].shift(1)) & (
+            df["MA_short"] > df["MA_long"]
+        )
+        sell = (df["MA_short"].shift(1) >= df["MA_long"].shift(1)) & (
+            df["MA_short"] < df["MA_long"]
+        )
 
         df.loc[buy, "signal"] = 1
         df.loc[sell, "signal"] = -1
@@ -148,7 +175,9 @@ class CryptoTrendStrategy(Strategy):
     Crypto trend-following strategy using fast/slow EMAs (long-only).
     """
 
-    def __init__(self, short_window: int = 7, long_window: int = 21, position_size: float = 100.0):
+    def __init__(
+        self, short_window: int = 7, long_window: int = 21, position_size: float = 100.0
+    ):
         if short_window >= long_window:
             raise ValueError("short_window must be strictly less than long_window.")
         if position_size <= 0:
@@ -172,6 +201,306 @@ class CryptoTrendStrategy(Strategy):
         df["target_qty"] = self.position_size
         return df
 
+
+class CrossSectionalPaperReversalStrategy(CrossSectionalStrategy):
+    """
+    Cross-sectional intraday reversal portfolio strategy.
+
+    Emits order intents for multiple symbols using columns:
+    - symbol
+    - signal (1 buy, -1 sell)
+    - target_qty (shares)
+    - limit_price (optional)
+    """
+
+    ANNUALIZATION_MINUTES = np.sqrt(252 * 6.5 * 60)
+
+    def __init__(
+        self,
+        lookback_minutes: int = 5,
+        hold_minutes: int = 10,
+        tail_quantile: float = 0.02,
+        top_n: int = 2000,
+        liquidity_lookback: int = 390,
+        min_universe_size: int = 40,
+        base_notional_per_name: float = 1_000.0,
+        target_annual_vol: float = 0.60,
+        volatility_window: int = 60,
+        max_leverage: float = 10.0,
+        min_annual_vol: float = 0.01,
+        allow_flips: bool = True,
+        refresh_hold_on_signal: bool = True,
+    ):
+        if lookback_minutes < 1:
+            raise ValueError("lookback_minutes must be at least 1.")
+        if hold_minutes < 1:
+            raise ValueError("hold_minutes must be at least 1.")
+        if not 0 < tail_quantile < 0.5:
+            raise ValueError("tail_quantile must be between 0 and 0.5.")
+        if top_n < 2:
+            raise ValueError("top_n must be at least 2.")
+        if liquidity_lookback < 5:
+            raise ValueError("liquidity_lookback must be at least 5.")
+        if min_universe_size < 2:
+            raise ValueError("min_universe_size must be at least 2.")
+        if base_notional_per_name <= 0:
+            raise ValueError("base_notional_per_name must be positive.")
+        if target_annual_vol < 0:
+            raise ValueError("target_annual_vol must be non-negative.")
+        if volatility_window < 5:
+            raise ValueError("volatility_window must be at least 5.")
+        if max_leverage <= 0:
+            raise ValueError("max_leverage must be positive.")
+        if min_annual_vol <= 0:
+            raise ValueError("min_annual_vol must be positive.")
+
+        self.lookback_minutes = lookback_minutes
+        self.hold_minutes = hold_minutes
+        self.tail_quantile = tail_quantile
+        self.top_n = top_n
+        self.liquidity_lookback = liquidity_lookback
+        self.min_universe_size = min_universe_size
+        self.base_notional_per_name = float(base_notional_per_name)
+        self.target_annual_vol = target_annual_vol
+        self.volatility_window = volatility_window
+        self.max_leverage = max_leverage
+        self.min_annual_vol = min_annual_vol
+        self.allow_flips = allow_flips
+        self.refresh_hold_on_signal = refresh_hold_on_signal
+
+        self.active_positions: dict[str, dict[str, float]] = {}
+
+    @property
+    def required_lookback(self) -> int:
+        return max(
+            self.lookback_minutes + 5,
+            self.liquidity_lookback + 5,
+            self.volatility_window + 5,
+        )
+
+    def _prepare_panel(self, panel_df: pd.DataFrame) -> pd.DataFrame:
+        df = panel_df.copy()
+        rename = {}
+        for col in df.columns:
+            key = str(col).strip().lower()
+            if key in {"datetime", "timestamp", "date", "time"}:
+                rename[col] = "Datetime"
+            elif key in {"symbol", "ticker"}:
+                rename[col] = "symbol"
+            elif key == "close":
+                rename[col] = "Close"
+            elif key == "volume":
+                rename[col] = "Volume"
+        if rename:
+            df = df.rename(columns=rename)
+
+        required = ["Datetime", "symbol", "Close", "Volume"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Cross-sectional strategy missing columns: {missing}")
+
+        out = df[required].copy()
+        out["Datetime"] = pd.to_datetime(out["Datetime"], utc=True, errors="coerce")
+        out["symbol"] = out["symbol"].astype(str).str.upper()
+        out = out.dropna(subset=["Datetime", "symbol", "Close", "Volume"])
+        out = out.sort_values(["symbol", "Datetime"]).drop_duplicates(
+            ["symbol", "Datetime"], keep="last"
+        )
+        return out
+
+    def _sync_with_positions(self, current_positions: dict[str, float] | None) -> None:
+        if current_positions is None:
+            return
+        normalized = {
+            str(symbol).upper(): float(qty)
+            for symbol, qty in current_positions.items()
+            if float(qty) != 0.0
+        }
+        for symbol in list(self.active_positions.keys()):
+            if symbol not in normalized:
+                self.active_positions.pop(symbol, None)
+        for symbol, qty in normalized.items():
+            if symbol in self.active_positions:
+                continue
+            self.active_positions[symbol] = {
+                "side": 1.0 if qty > 0 else -1.0,
+                "qty": abs(qty),
+                "bars_left": float(self.hold_minutes),
+            }
+
+    def run_panel(
+        self,
+        panel_df: pd.DataFrame,
+        current_positions: dict[str, float] | None = None,
+    ) -> pd.DataFrame:
+        panel = self._prepare_panel(panel_df)
+        if panel.empty:
+            return pd.DataFrame(
+                columns=["symbol", "signal", "target_qty", "limit_price"]
+            )
+
+        self._sync_with_positions(current_positions)
+
+        panel["ret_lb"] = panel.groupby("symbol")["Close"].pct_change(
+            self.lookback_minutes
+        )
+        panel["ret_1m"] = panel.groupby("symbol")["Close"].pct_change()
+        panel["dollar_volume"] = panel["Close"] * panel["Volume"]
+        panel["adv"] = panel.groupby("symbol")["dollar_volume"].transform(
+            lambda s: s.rolling(
+                self.liquidity_lookback,
+                min_periods=max(5, self.liquidity_lookback // 3),
+            ).mean()
+        )
+        panel["ann_vol"] = (
+            panel.groupby("symbol")["ret_1m"].transform(
+                lambda s: s.rolling(
+                    self.volatility_window,
+                    min_periods=max(5, self.volatility_window // 3),
+                ).std()
+            )
+            * self.ANNUALIZATION_MINUTES
+        )
+
+        latest_rows = (
+            panel.sort_values("Datetime").groupby("symbol", as_index=False).tail(1)
+        )
+        latest_prices = dict(zip(latest_rows["symbol"], latest_rows["Close"]))
+
+        orders: list[dict[str, float | int | str]] = []
+
+        for symbol in list(self.active_positions.keys()):
+            state = self.active_positions[symbol]
+            state["bars_left"] -= 1
+
+        liquid = latest_rows.dropna(subset=["ret_lb", "adv"]).copy()
+        if not liquid.empty:
+            liquid["liquidity_rank"] = liquid["adv"].rank(
+                ascending=False, method="first"
+            )
+            liquid = liquid[liquid["liquidity_rank"] <= float(self.top_n)].copy()
+
+        desired_side: dict[str, int] = {}
+        qty_for_symbol: dict[str, int] = {}
+
+        if len(liquid) >= self.min_universe_size:
+            tail_count = max(1, int(np.floor(len(liquid) * self.tail_quantile)))
+            long_candidates = liquid.sort_values("ret_lb", ascending=True).head(
+                tail_count
+            )
+            short_candidates = liquid.sort_values("ret_lb", ascending=False).head(
+                tail_count
+            )
+
+            side_count = int(min(len(long_candidates), len(short_candidates)))
+            if side_count > 0:
+                long_candidates = long_candidates.head(side_count)
+                short_candidates = short_candidates.head(side_count)
+
+                vol_proxy = (
+                    float(liquid["ann_vol"].dropna().median())
+                    if liquid["ann_vol"].notna().any()
+                    else self.min_annual_vol
+                )
+                vol_proxy = max(vol_proxy, self.min_annual_vol)
+                leverage = 1.0
+                if self.target_annual_vol > 0:
+                    leverage = min(
+                        self.max_leverage, self.target_annual_vol / vol_proxy
+                    )
+
+                notional_per_name = self.base_notional_per_name * leverage
+                for _, row in long_candidates.iterrows():
+                    symbol = str(row["symbol"])
+                    close = float(row["Close"])
+                    qty = max(1, int(notional_per_name / close)) if close > 0 else 0
+                    if qty <= 0:
+                        continue
+                    desired_side[symbol] = 1
+                    qty_for_symbol[symbol] = qty
+
+                for _, row in short_candidates.iterrows():
+                    symbol = str(row["symbol"])
+                    close = float(row["Close"])
+                    qty = max(1, int(notional_per_name / close)) if close > 0 else 0
+                    if qty <= 0:
+                        continue
+                    desired_side[symbol] = -1
+                    qty_for_symbol[symbol] = qty
+
+        for symbol in list(self.active_positions.keys()):
+            state = self.active_positions[symbol]
+            side = int(np.sign(state["side"]))
+            qty = int(max(1, round(float(state["qty"]))))
+            desired = int(desired_side.get(symbol, 0))
+
+            if desired == side:
+                if self.refresh_hold_on_signal:
+                    state["bars_left"] = float(self.hold_minutes)
+                    state["qty"] = float(qty_for_symbol.get(symbol, qty))
+                continue
+
+            if desired != 0 and self.allow_flips:
+                new_qty = int(max(1, qty_for_symbol.get(symbol, qty)))
+                flip_qty = qty + new_qty
+                orders.append(
+                    {
+                        "symbol": symbol,
+                        "signal": desired,
+                        "target_qty": flip_qty,
+                        "limit_price": float(latest_prices.get(symbol, np.nan)),
+                    }
+                )
+                self.active_positions[symbol] = {
+                    "side": float(desired),
+                    "qty": float(new_qty),
+                    "bars_left": float(self.hold_minutes),
+                }
+                continue
+
+            if state["bars_left"] <= 0:
+                orders.append(
+                    {
+                        "symbol": symbol,
+                        "signal": -side,
+                        "target_qty": qty,
+                        "limit_price": float(latest_prices.get(symbol, np.nan)),
+                    }
+                )
+                self.active_positions.pop(symbol, None)
+
+        for symbol, desired in desired_side.items():
+            if symbol in self.active_positions:
+                continue
+            qty = int(max(1, qty_for_symbol.get(symbol, 1)))
+            orders.append(
+                {
+                    "symbol": symbol,
+                    "signal": int(desired),
+                    "target_qty": qty,
+                    "limit_price": float(latest_prices.get(symbol, np.nan)),
+                }
+            )
+            self.active_positions[symbol] = {
+                "side": float(desired),
+                "qty": float(qty),
+                "bars_left": float(self.hold_minutes),
+            }
+
+        if not orders:
+            return pd.DataFrame(
+                columns=["symbol", "signal", "target_qty", "limit_price"]
+            )
+
+        out = pd.DataFrame(orders)
+        out = out.dropna(subset=["symbol", "signal", "target_qty"])
+        out["symbol"] = out["symbol"].astype(str).str.upper()
+        out["signal"] = out["signal"].astype(int)
+        out["target_qty"] = out["target_qty"].astype(float)
+        out = out[out["target_qty"] > 0]
+        return out[["symbol", "signal", "target_qty", "limit_price"]]
+
+
 class DemoStrategy(Strategy):
     """
     Simple demo strategy - buys 1 share when price up, sells 1 share when price down.
@@ -190,7 +519,7 @@ class DemoStrategy(Strategy):
 
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
         df["signal"] = 0
-        df.loc[df["change"] > 0, "signal"] = 1   # Price went up -> buy
+        df.loc[df["change"] > 0, "signal"] = 1  # Price went up -> buy
         df.loc[df["change"] < 0, "signal"] = -1  # Price went down -> sell
         df["position"] = df["signal"]
         df["target_qty"] = self.position_size
