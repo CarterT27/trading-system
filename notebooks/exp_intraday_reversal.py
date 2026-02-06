@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -270,7 +270,7 @@ def compute_metrics(
 def run_vectorized_backtest(
     close: pd.DataFrame,
     volume: pd.DataFrame,
-    spy_close: pd.Series,
+    spy_close: Optional[pd.Series],
     lookback: int,
     hold_minutes: int,
     decile: float,
@@ -283,6 +283,7 @@ def run_vectorized_backtest(
     min_universe_size: int,
     target_annual_vol: float,
     max_leverage: float,
+    use_beta_hedge: bool,
 ) -> BacktestResult:
     entry = build_entry_weights(
         close=close,
@@ -297,26 +298,40 @@ def run_vectorized_backtest(
     )
 
     close_returns = close.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    spy_returns = spy_close.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if use_beta_hedge:
+        if spy_close is None:
+            raise ValueError("SPY series is required when --use-beta-hedge is enabled.")
+        spy_returns = (
+            spy_close.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
+        beta_cov = close_returns.rolling(
+            beta_window, min_periods=max(10, beta_window // 3)
+        ).cov(spy_returns)
+        spy_var = spy_returns.rolling(
+            beta_window, min_periods=max(10, beta_window // 3)
+        ).var()
+        beta = (
+            beta_cov.div(spy_var, axis=0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
+    else:
+        spy_returns = pd.Series(0.0, index=close_returns.index, dtype=float)
+        beta = pd.DataFrame(
+            0.0, index=close_returns.index, columns=close_returns.columns
+        )
 
     active_weights = (
         entry.shift(1).rolling(hold_minutes, min_periods=1).mean().fillna(0.0)
     )
 
-    beta_cov = close_returns.rolling(
-        beta_window, min_periods=max(10, beta_window // 3)
-    ).cov(spy_returns)
-    spy_var = spy_returns.rolling(
-        beta_window, min_periods=max(10, beta_window // 3)
-    ).var()
-    beta = beta_cov.div(spy_var, axis=0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
     if target_annual_vol > 0:
         base_weights = active_weights.shift(1).fillna(0.0)
         base_asset_ret = (base_weights * close_returns).sum(axis=1)
-        base_port_beta = (base_weights * beta).sum(axis=1)
-        base_hedge_ret = -base_port_beta * spy_returns
-        base_total = base_asset_ret + base_hedge_ret
+        if use_beta_hedge:
+            base_port_beta = (base_weights * beta).sum(axis=1)
+            base_hedge_ret = -base_port_beta * spy_returns
+            base_total = base_asset_ret + base_hedge_ret
+        else:
+            base_total = base_asset_ret
 
         target_minute_vol = target_annual_vol / np.sqrt(ANNUAL_MINUTES)
         realized_minute_vol = base_total.rolling(60, min_periods=20).std()
@@ -330,9 +345,12 @@ def run_vectorized_backtest(
 
     bar_weights = scaled_weights.shift(1).fillna(0.0)
     asset_ret = (bar_weights * close_returns).sum(axis=1)
-    portfolio_beta = (bar_weights * beta).sum(axis=1)
-    hedge_ret = -portfolio_beta * spy_returns
-    gross_returns = asset_ret + hedge_ret
+    if use_beta_hedge:
+        portfolio_beta = (bar_weights * beta).sum(axis=1)
+        hedge_ret = -portfolio_beta * spy_returns
+        gross_returns = asset_ret + hedge_ret
+    else:
+        gross_returns = asset_ret
 
     turnover = (scaled_weights - scaled_weights.shift(1)).abs().sum(axis=1).fillna(0.0)
     net_returns = gross_returns - turnover * (cost_bps / 10_000.0)
@@ -355,8 +373,8 @@ def run_vectorized_backtest(
 
 
 def build_wide_frames(
-    panel: pd.DataFrame, spy_symbol: str
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    panel: pd.DataFrame, spy_symbol: str, require_spy: bool
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.Series]]:
     wide_close = (
         panel.pivot_table(
             index="Datetime", columns="symbol", values="Close", aggfunc="last"
@@ -373,11 +391,17 @@ def build_wide_frames(
     )
 
     spy_symbol = spy_symbol.upper()
-    if spy_symbol not in wide_close.columns:
+    if require_spy and spy_symbol not in wide_close.columns:
         raise ValueError(f"SPY hedge symbol '{spy_symbol}' is missing from input data.")
 
-    spy_close = wide_close[spy_symbol].copy()
-    universe_cols = [c for c in wide_close.columns if c != spy_symbol]
+    if require_spy:
+        spy_close = wide_close[spy_symbol].copy()
+        universe_cols = [c for c in wide_close.columns if c != spy_symbol]
+    else:
+        spy_close = (
+            wide_close[spy_symbol].copy() if spy_symbol in wide_close.columns else None
+        )
+        universe_cols = list(wide_close.columns)
     if not universe_cols:
         raise ValueError("No tradable symbols remain after removing SPY hedge symbol.")
 
@@ -387,7 +411,8 @@ def build_wide_frames(
     valid_rows = close.notna().sum(axis=1) > 0
     close = close.loc[valid_rows]
     volume = volume.loc[valid_rows]
-    spy_close = spy_close.reindex(close.index).ffill().bfill()
+    if spy_close is not None:
+        spy_close = spy_close.reindex(close.index).ffill().bfill()
     return close, volume, spy_close
 
 
@@ -430,6 +455,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--spy-symbol", type=str, default="SPY", help="Benchmark symbol for beta hedge."
+    )
+    parser.add_argument(
+        "--use-beta-hedge",
+        action="store_true",
+        help="Enable SPY beta hedge path (disabled by default for live parity).",
     )
     parser.add_argument(
         "--top-n",
@@ -528,7 +558,11 @@ def main() -> None:
         files = sorted(Path().glob(args.input_glob))
         panel = load_panel_from_symbol_csvs(files)
 
-    close, volume, spy_close = build_wide_frames(panel, spy_symbol=args.spy_symbol)
+    close, volume, spy_close = build_wide_frames(
+        panel,
+        spy_symbol=args.spy_symbol,
+        require_spy=args.use_beta_hedge,
+    )
     sector_map = (
         load_sector_map(Path(args.sector_map), panel)
         if args.sector_map
@@ -560,6 +594,7 @@ def main() -> None:
                 min_universe_size=args.min_universe,
                 target_annual_vol=args.target_annual_vol,
                 max_leverage=args.max_leverage,
+                use_beta_hedge=args.use_beta_hedge,
             )
             row = {
                 "lookback": lookback,
@@ -601,6 +636,7 @@ def main() -> None:
             min_universe_size=args.min_universe,
             target_annual_vol=args.target_annual_vol,
             max_leverage=args.max_leverage,
+            use_beta_hedge=args.use_beta_hedge,
         )
         cost_rows.append({"cost_bps": cost_bps, **cost_result.metrics})
         if abs(cost_bps - args.cost_bps) < 1e-12:
@@ -629,6 +665,7 @@ def main() -> None:
     ).to_csv(metrics_path, index=False)
 
     print("Intraday reversal experiment complete")
+    print(f"Beta hedge: {'ON' if args.use_beta_hedge else 'OFF'}")
     print(f"Symbols: {close.shape[1]} | Bars: {close.shape[0]}")
     print(
         f"Best params: lookback={best_result.lookback}, hold={best_result.hold_minutes}m"
