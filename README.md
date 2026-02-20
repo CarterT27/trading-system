@@ -128,6 +128,12 @@ Cross-sectional portfolio backtest from panel data:
 python run_backtest.py --panel-csv data/panels/us_equities_1min_panel.csv --symbols-file data/universe.txt --strategy cross_sectional_reversal
 ```
 
+## Backtest vs Paper Parity (Alpaca Free Plan)
+
+For a detailed parity map between this repo's backtester and Alpaca paper trading (including shorting rules, tradable universe constraints, sizing limits, and known simulation gaps), see:
+
+- `docs/backtest-paper-parity.md`
+
 ---
 
 ## Build Your Own Strategy
