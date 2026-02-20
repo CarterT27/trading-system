@@ -40,6 +40,7 @@ from core.symbols import resolve_symbols
 from pipeline.alpaca import clean_market_data, save_bars
 from strategies import (
     CrossSectionalPaperReversalStrategy,
+    CryptoRegimeTrendStrategy,
     CryptoTrendStrategy,
     DemoStrategy,
     MovingAverageStrategy,
@@ -307,6 +308,10 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
         return CryptoTrendStrategy(
             short_window=args.short_window,
             long_window=args.long_window,
+            position_size=args.position_size,
+        )
+    if strategy_cls is CryptoRegimeTrendStrategy:
+        return CryptoRegimeTrendStrategy(
             position_size=args.position_size,
         )
     if strategy_cls is DemoStrategy:

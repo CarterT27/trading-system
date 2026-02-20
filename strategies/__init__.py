@@ -9,6 +9,7 @@ from . import strategy_base
 from .strategy_base import (
     CrossSectionalPaperReversalStrategy,
     CrossSectionalStrategy,
+    CryptoRegimeTrendStrategy,
     CryptoTrendStrategy,
     DemoStrategy,
     MovingAverageStrategy,
@@ -23,6 +24,8 @@ _BUILTIN_STRATEGIES: Dict[str, Type[Strategy]] = {
     "template": TemplateStrategy,
     "student": TemplateStrategy,
     "crypto_trend": CryptoTrendStrategy,
+    "crypto_regime_trend": CryptoRegimeTrendStrategy,
+    "crypto_regime": CryptoRegimeTrendStrategy,
     "crypto": CryptoTrendStrategy,
     "demo": DemoStrategy,
     "cross_sectional_reversal": CrossSectionalPaperReversalStrategy,
@@ -32,6 +35,7 @@ _BUILTIN_CLASSES = {
     MovingAverageStrategy,
     TemplateStrategy,
     CryptoTrendStrategy,
+    CryptoRegimeTrendStrategy,
     DemoStrategy,
     CrossSectionalPaperReversalStrategy,
 }
@@ -73,6 +77,7 @@ __all__ = [
     "CrossSectionalPaperReversalStrategy",
     "MovingAverageStrategy",
     "CryptoTrendStrategy",
+    "CryptoRegimeTrendStrategy",
     "DemoStrategy",
     "get_strategy_class",
     "list_strategies",
