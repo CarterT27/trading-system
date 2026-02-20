@@ -6,7 +6,15 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from core.paper_parity import PaperParityConfig, normalize_paper_parity_config
+from core.asset_eligibility import (
+    evaluate_asset_eligibility,
+    normalize_asset_flags_by_symbol,
+)
+from core.paper_parity import (
+    PaperParityConfig,
+    normalize_paper_parity_config,
+    short_open_unit_value,
+)
 from strategies import Strategy
 
 
@@ -33,13 +41,17 @@ class MultiAssetBacktester:
         strategy_factory: Callable[[], Strategy],
         initial_capital: float = 50_000.0,
         max_notional_per_order: Optional[float] = None,
+        max_short_notional: Optional[float] = None,
         paper_parity: Optional[PaperParityConfig] = None,
+        asset_flags_by_symbol: Optional[Dict[str, object]] = None,
     ):
         self.panel_df = self._prepare_panel(panel_df)
         self.strategy_factory = strategy_factory
         self.initial_capital = float(initial_capital)
         self.max_notional_per_order = max_notional_per_order
+        self.max_short_notional = max_short_notional
         self.paper_parity = normalize_paper_parity_config(paper_parity)
+        self.asset_flags_by_symbol = normalize_asset_flags_by_symbol(asset_flags_by_symbol)
 
         strategy_probe = strategy_factory()
         self.portfolio_strategy: Optional[Strategy] = None
@@ -62,6 +74,82 @@ class MultiAssetBacktester:
         self.cash_curve: List[float] = []
         self.timestamp_curve: List[pd.Timestamp] = []
         self.trades: List[MultiAssetTradeRecord] = []
+        self.rejections: List[dict] = []
+        self.reservation_events: List[dict] = []
+        self._batch_reserved_buying_power = 0.0
+
+    def _projected_total_short_notional(
+        self,
+        symbol: str,
+        new_qty: int,
+        trade_price: float,
+    ) -> float:
+        total = 0.0
+        for sym, qty in self.position_by_symbol.items():
+            projected_qty = new_qty if sym == symbol else int(qty)
+            if projected_qty >= 0:
+                continue
+            px = trade_price if sym == symbol else self.latest_price_by_symbol.get(sym)
+            if px is None or px <= 0:
+                continue
+            total += abs(projected_qty) * float(px)
+        if symbol not in self.position_by_symbol and new_qty < 0:
+            total += abs(new_qty) * trade_price
+        return total
+
+    def _current_short_notional(self) -> float:
+        total = 0.0
+        for symbol, qty in self.position_by_symbol.items():
+            if qty >= 0:
+                continue
+            px = self.latest_price_by_symbol.get(symbol)
+            if px is None or px <= 0:
+                continue
+            total += abs(qty) * float(px)
+        return total
+
+    def _opening_long_qty(self, current_position: int, qty: int) -> int:
+        short_to_cover = max(0, -int(current_position))
+        return max(0, int(qty) - short_to_cover)
+
+    def _opening_short_qty(self, current_position: int, qty: int) -> int:
+        long_to_close = max(0, int(current_position))
+        return max(0, int(qty) - long_to_close)
+
+    def _reservation_cost(
+        self,
+        *,
+        side: str,
+        current_position: int,
+        qty: int,
+        limit_price: float,
+        reference_price: float,
+    ) -> float:
+        if not self.paper_parity.enabled or not self.paper_parity.reserve_open_orders:
+            return 0.0
+
+        opening_long_qty = (
+            self._opening_long_qty(current_position=current_position, qty=qty)
+            if side == "buy"
+            else 0
+        )
+        opening_short_qty = (
+            self._opening_short_qty(current_position=current_position, qty=qty)
+            if side == "sell"
+            else 0
+        )
+        if self.paper_parity.reserve_open_orders_for_shorts_only:
+            opening_long_qty = 0
+
+        long_notional = limit_price * float(opening_long_qty)
+        short_notional = 0.0
+        if opening_short_qty > 0:
+            short_notional = short_open_unit_value(
+                limit_price=limit_price,
+                reference_price=reference_price,
+                buffer=float(self.paper_parity.short_open_valuation_buffer),
+            ) * float(opening_short_qty)
+        return max(0.0, long_notional + short_notional)
 
     def _prepare_panel(self, panel: pd.DataFrame) -> pd.DataFrame:
         df = panel.copy()
@@ -170,6 +258,26 @@ class MultiAssetBacktester:
         current = int(self.position_by_symbol.get(symbol, 0))
         side = "buy" if signal > 0 else "sell"
 
+        eligible, reason = evaluate_asset_eligibility(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            current_position=current,
+            parity=self.paper_parity,
+            asset_flags_by_symbol=self.asset_flags_by_symbol,
+        )
+        if not eligible:
+            self.rejections.append(
+                {
+                    "timestamp": timestamp,
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "reason": reason,
+                }
+            )
+            return
+
         if side == "buy" and current > 0:
             return
         if side == "sell" and current < 0:
@@ -182,13 +290,133 @@ class MultiAssetBacktester:
             return
 
         if side == "buy":
-            affordable = int(self.cash / price)
+            affordable_cash = self.cash
+            if self.paper_parity.enabled and self.paper_parity.reserve_open_orders:
+                affordable_cash -= self._batch_reserved_buying_power
+            affordable = int(max(0.0, affordable_cash) / price)
             qty = min(qty, affordable)
             if qty <= 0:
+                if self.paper_parity.enabled and self.paper_parity.reserve_open_orders:
+                    self.rejections.append(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": symbol,
+                            "side": side,
+                            "qty": qty,
+                            "reason": "reject_reserved_buying_power",
+                        }
+                    )
                 return
+            reservation = self._reservation_cost(
+                side=side,
+                current_position=current,
+                qty=qty,
+                limit_price=price,
+                reference_price=float(self.latest_price_by_symbol.get(symbol, price)),
+            )
+            if reservation > 0:
+                self._batch_reserved_buying_power += reservation
+                self.reservation_events.append(
+                    {
+                        "timestamp": timestamp,
+                        "symbol": symbol,
+                        "action": "reserve",
+                        "amount": reservation,
+                    }
+                )
             self.cash -= qty * price
             self.position_by_symbol[symbol] = current + qty
         else:
+            opening_short_qty = max(0, qty - max(0, current))
+            if opening_short_qty > 0 and self.paper_parity.enabled:
+                reference_price = self.latest_price_by_symbol.get(symbol, price)
+                if reference_price is None or reference_price <= 0:
+                    self.rejections.append(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": symbol,
+                            "side": side,
+                            "qty": qty,
+                            "reason": "reject_invalid_short_reference",
+                        }
+                    )
+                    return
+                try:
+                    short_value = short_open_unit_value(
+                        limit_price=price,
+                        reference_price=float(reference_price),
+                        buffer=float(self.paper_parity.short_open_valuation_buffer),
+                    )
+                except ValueError:
+                    self.rejections.append(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": symbol,
+                            "side": side,
+                            "qty": qty,
+                            "reason": "reject_invalid_short_valuation",
+                        }
+                    )
+                    return
+
+                anchor_equity = (
+                    float(self.paper_parity.account_equity)
+                    if self.paper_parity.account_equity is not None
+                    else float(self.initial_capital)
+                )
+                buying_power_limit = anchor_equity * float(
+                    self.paper_parity.buying_power_multiplier()
+                )
+                available_short_bp = max(
+                    0.0,
+                    buying_power_limit
+                    - self._current_short_notional()
+                    - (
+                        self._batch_reserved_buying_power
+                        if self.paper_parity.reserve_open_orders
+                        else 0.0
+                    ),
+                )
+                required_short_bp = short_value * float(opening_short_qty)
+                if required_short_bp > available_short_bp:
+                    self.rejections.append(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": symbol,
+                            "side": side,
+                            "qty": qty,
+                            "reason": "reject_short_open_buying_power",
+                        }
+                    )
+                    return
+
+            reservation = self._reservation_cost(
+                side=side,
+                current_position=current,
+                qty=qty,
+                limit_price=price,
+                reference_price=float(self.latest_price_by_symbol.get(symbol, price)),
+            )
+            if reservation > 0:
+                self._batch_reserved_buying_power += reservation
+                self.reservation_events.append(
+                    {
+                        "timestamp": timestamp,
+                        "symbol": symbol,
+                        "action": "reserve",
+                        "amount": reservation,
+                    }
+                )
+
+            projected_position = current - qty
+            if projected_position < 0 and self.max_short_notional is not None:
+                projected_short_notional = self._projected_total_short_notional(
+                    symbol=symbol,
+                    new_qty=projected_position,
+                    trade_price=price,
+                )
+                if projected_short_notional > float(self.max_short_notional):
+                    return
             self.cash += qty * price
             self.position_by_symbol[symbol] = current - qty
 
@@ -205,6 +433,7 @@ class MultiAssetBacktester:
     def run(self) -> pd.DataFrame:
         if self.portfolio_strategy is not None:
             for timestamp, chunk in self.panel_df.groupby("Datetime"):
+                self._batch_reserved_buying_power = 0.0
                 for _, row in chunk.iterrows():
                     symbol = str(row["symbol"])
                     self.latest_price_by_symbol[symbol] = float(row["Close"])
@@ -243,6 +472,17 @@ class MultiAssetBacktester:
                             price = float(limit) if pd.notna(limit) else close
                             self._apply_trade(timestamp, symbol, signal, qty, price)
 
+                if self._batch_reserved_buying_power > 0:
+                    self.reservation_events.append(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": "*",
+                            "action": "release",
+                            "amount": self._batch_reserved_buying_power,
+                        }
+                    )
+                    self._batch_reserved_buying_power = 0.0
+
                 equity = self.cash
                 for symbol, qty in self.position_by_symbol.items():
                     if qty == 0:
@@ -259,6 +499,7 @@ class MultiAssetBacktester:
             signals = self._build_signal_panel()
 
             for timestamp, chunk in signals.groupby("Datetime"):
+                self._batch_reserved_buying_power = 0.0
                 for _, row in chunk.iterrows():
                     symbol = str(row["symbol"])
                     close = float(row["Close"])
@@ -277,6 +518,17 @@ class MultiAssetBacktester:
                     limit = row.get("limit_price", np.nan)
                     price = float(limit) if pd.notna(limit) else close
                     self._apply_trade(timestamp, symbol, signal, qty, price)
+
+                if self._batch_reserved_buying_power > 0:
+                    self.reservation_events.append(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": "*",
+                            "action": "release",
+                            "amount": self._batch_reserved_buying_power,
+                        }
+                    )
+                    self._batch_reserved_buying_power = 0.0
 
                 equity = self.cash
                 for symbol, qty in self.position_by_symbol.items():

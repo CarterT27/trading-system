@@ -134,6 +134,35 @@ For a detailed parity map between this repo's backtester and Alpaca paper tradin
 
 - `docs/backtest-paper-parity.md`
 
+### Paper-Parity CLI controls
+
+Use these flags with `run_backtest.py` to enable parity checks:
+
+- `--paper-parity`
+- `--asset-flags-csv <path.csv>` (columns: `symbol` or `ticker`, `tradable`, `shortable`, `easy_to_borrow`)
+- `--account-equity <float>`
+- `--buying-power-mode {disabled,multiplier,tiered}`
+- `--buying-power-multiplier <float>` (when mode is `multiplier`)
+- `--reserve-open-orders`
+- `--max-notional-per-order <float>` (multi-asset)
+- `--max-short-notional <float>` (multi-asset)
+
+Example (multi-asset parity run):
+
+```bash
+python run_backtest.py \
+  --panel-csv data/panels/us_equities_1min_panel.csv \
+  --symbols-file data/universe_long_short.csv \
+  --strategy cross_sectional_reversal \
+  --paper-parity \
+  --asset-flags-csv data/alpaca_asset_flags.csv \
+  --account-equity 25000 \
+  --buying-power-mode tiered \
+  --reserve-open-orders \
+  --max-notional-per-order 5000 \
+  --max-short-notional 50000
+```
+
 ---
 
 ## Build Your Own Strategy
