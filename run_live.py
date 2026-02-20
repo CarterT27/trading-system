@@ -117,8 +117,8 @@ Examples:
     parser.add_argument(
         "--max-order-notional",
         type=float,
-        default=None,
-        help="Max notional per order (crypto only)",
+        default=2_000.0,
+        help="Max notional per order",
     )
     parser.add_argument(
         "--momentum-lookback",
@@ -147,8 +147,8 @@ Examples:
     parser.add_argument(
         "--cs-hold",
         type=int,
-        default=30,
-        help="Holding window in minutes for cross-sectional reversal strategy (default: 30).",
+        default=45,
+        help="Holding window in minutes for cross-sectional reversal strategy (default: 45).",
     )
     parser.add_argument(
         "--cs-tail-quantile",
@@ -177,14 +177,14 @@ Examples:
     parser.add_argument(
         "--cs-base-notional",
         type=float,
-        default=1000.0,
-        help="Base dollar notional per name before leverage in cross-sectional mode (default: 1000).",
+        default=500.0,
+        help="Base dollar notional per name before leverage in cross-sectional mode (default: 500).",
     )
     parser.add_argument(
         "--cs-target-annual-vol",
         type=float,
-        default=0.60,
-        help="Vol-target for cross-sectional leverage sizing; 0 disables (default: 0.60).",
+        default=0.30,
+        help="Vol-target for cross-sectional leverage sizing; 0 disables (default: 0.30).",
     )
     parser.add_argument(
         "--cs-vol-window",
@@ -195,8 +195,8 @@ Examples:
     parser.add_argument(
         "--cs-max-leverage",
         type=float,
-        default=10.0,
-        help="Max leverage for cross-sectional sizing (default: 10.0).",
+        default=2.0,
+        help="Max leverage for cross-sectional sizing (default: 2.0).",
     )
     parser.add_argument(
         "--cs-min-annual-vol",
@@ -206,8 +206,15 @@ Examples:
     )
     parser.add_argument(
         "--cs-no-flips",
+        dest="cs_no_flips",
         action="store_true",
-        help="Disable immediate side flips in cross-sectional mode.",
+        help="Disable immediate side flips in cross-sectional mode (default).",
+    )
+    parser.add_argument(
+        "--cs-allow-flips",
+        dest="cs_no_flips",
+        action="store_false",
+        help="Allow immediate side flips in cross-sectional mode.",
     )
     parser.add_argument(
         "--iterations", type=int, default=1, help="Number of loops to run (default: 1)"
@@ -249,8 +256,8 @@ Examples:
     parser.add_argument(
         "--max-orders-per-cycle",
         type=int,
-        default=25,
-        help="Maximum orders to submit each loop in multi-asset mode (default: 25).",
+        default=10,
+        help="Maximum orders to submit each loop in multi-asset mode (default: 10).",
     )
     parser.add_argument(
         "--data-fetch-retries",
@@ -267,14 +274,14 @@ Examples:
     parser.add_argument(
         "--buying-power-buffer",
         type=float,
-        default=0.05,
-        help="Fraction of buying power to reserve in multi-asset mode (default: 0.05).",
+        default=0.20,
+        help="Fraction of buying power to reserve in multi-asset mode (default: 0.20).",
     )
     parser.add_argument(
         "--buying-power-cooldown-cycles",
         type=int,
-        default=3,
-        help="Cooldown cycles after insufficient buying-power rejects in multi-asset mode (default: 3).",
+        default=5,
+        help="Cooldown cycles after insufficient buying-power rejects in multi-asset mode (default: 5).",
     )
     parser.add_argument(
         "--skip-preload",
@@ -286,6 +293,7 @@ Examples:
         action="store_true",
         help="List available strategies and exit",
     )
+    parser.set_defaults(cs_no_flips=True)
     return parser.parse_args()
 
 
