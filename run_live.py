@@ -41,6 +41,7 @@ from pipeline.alpaca import clean_market_data, save_bars
 from strategies import (
     CrossSectionalPaperReversalStrategy,
     CryptoCompetitionStrategy,
+    CryptoCompetitionPortfolioStrategy,
     CryptoRegimeTrendStrategy,
     CryptoTrendStrategy,
     DemoStrategy,
@@ -73,7 +74,7 @@ Examples:
     parser.add_argument(
         "--symbols",
         default="",
-        help="Comma-separated symbols for multi-asset mode (stocks only).",
+        help="Comma-separated symbols for multi-asset mode.",
     )
     parser.add_argument(
         "--symbols-file",
@@ -115,6 +116,95 @@ Examples:
         type=float,
         default=10.0,
         help="Per-trade position size (default: 10.0)",
+    )
+    parser.add_argument(
+        "--meta-no-trade-band",
+        type=float,
+        default=0.03,
+        help="Hysteresis half-band around meta threshold for crypto competition strategy.",
+    )
+    parser.add_argument(
+        "--meta-use-xgboost",
+        action="store_true",
+        help="Include optional XGBoost leg in crypto competition strategy meta ensemble.",
+    )
+    parser.add_argument(
+        "--meta-prob-threshold",
+        type=float,
+        default=0.50,
+        help="Meta probability threshold for crypto competition strategies.",
+    )
+    parser.add_argument(
+        "--meta-refit-interval",
+        type=int,
+        default=120,
+        help="Bars between meta-model refits for crypto competition strategies.",
+    )
+    parser.add_argument(
+        "--meta-train-window",
+        type=int,
+        default=3000,
+        help="Rolling training window for meta model (<=0 disables full-history mode).",
+    )
+    parser.add_argument(
+        "--sizing-scale",
+        type=float,
+        default=1.5,
+        help="Dynamic sizing scale for crypto competition strategies.",
+    )
+    parser.add_argument(
+        "--sizing-offset",
+        type=float,
+        default=0.3,
+        help="Dynamic sizing offset for crypto competition strategies.",
+    )
+    parser.add_argument(
+        "--sizing-min-size",
+        type=float,
+        default=0.05,
+        help="Minimum dynamic position fraction for crypto competition strategies.",
+    )
+    parser.add_argument(
+        "--exit-time-bars",
+        type=int,
+        default=180,
+        help="Time-stop bars for crypto competition strategies (<=0 disables).",
+    )
+    parser.add_argument(
+        "--exit-trail-stop",
+        type=float,
+        default=0.008,
+        help="Trailing-stop drawdown for crypto competition strategies (<=0 disables).",
+    )
+    parser.add_argument(
+        "--exit-min-hold-bars",
+        type=int,
+        default=0,
+        help="Minimum hold bars before exit rules can trigger in crypto competition strategies.",
+    )
+    parser.add_argument(
+        "--portfolio-notional",
+        type=float,
+        default=100_000.0,
+        help="Portfolio gross notional budget for crypto competition portfolio strategy.",
+    )
+    parser.add_argument(
+        "--portfolio-min-order-notional",
+        type=float,
+        default=5.0,
+        help="Minimum notional delta required for portfolio rebalance orders.",
+    )
+    parser.add_argument(
+        "--portfolio-fractional-qty",
+        dest="portfolio_fractional_qty",
+        action="store_true",
+        help="Allow fractional target_qty in portfolio strategy output (default).",
+    )
+    parser.add_argument(
+        "--portfolio-integer-qty",
+        dest="portfolio_fractional_qty",
+        action="store_false",
+        help="Force integer target_qty in portfolio strategy output.",
     )
     parser.add_argument(
         "--max-order-notional",
@@ -295,7 +385,7 @@ Examples:
         action="store_true",
         help="List available strategies and exit",
     )
-    parser.set_defaults(cs_no_flips=True)
+    parser.set_defaults(cs_no_flips=True, portfolio_fractional_qty=True)
     return parser.parse_args()
 
 
@@ -320,8 +410,54 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
             position_size=args.position_size,
         )
     if strategy_cls is CryptoCompetitionStrategy:
+        meta_train_window = (
+            None if int(args.meta_train_window) <= 0 else int(args.meta_train_window)
+        )
+        exit_time_bars = (
+            None if int(args.exit_time_bars) <= 0 else int(args.exit_time_bars)
+        )
+        exit_trail_stop = (
+            None if float(args.exit_trail_stop) <= 0 else float(args.exit_trail_stop)
+        )
         return CryptoCompetitionStrategy(
             position_size=args.position_size,
+            meta_no_trade_band=args.meta_no_trade_band,
+            meta_use_xgboost=bool(args.meta_use_xgboost),
+            meta_prob_threshold=args.meta_prob_threshold,
+            meta_refit_interval=args.meta_refit_interval,
+            meta_train_window=meta_train_window,
+            sizing_scale=args.sizing_scale,
+            sizing_offset=args.sizing_offset,
+            sizing_min_size=args.sizing_min_size,
+            exit_time_bars=exit_time_bars,
+            exit_trail_stop=exit_trail_stop,
+            exit_min_hold_bars=args.exit_min_hold_bars,
+        )
+    if strategy_cls is CryptoCompetitionPortfolioStrategy:
+        meta_train_window = (
+            None if int(args.meta_train_window) <= 0 else int(args.meta_train_window)
+        )
+        exit_time_bars = (
+            None if int(args.exit_time_bars) <= 0 else int(args.exit_time_bars)
+        )
+        exit_trail_stop = (
+            None if float(args.exit_trail_stop) <= 0 else float(args.exit_trail_stop)
+        )
+        return CryptoCompetitionPortfolioStrategy(
+            portfolio_notional=args.portfolio_notional,
+            allow_fractional_qty=bool(args.portfolio_fractional_qty),
+            min_order_notional=args.portfolio_min_order_notional,
+            meta_no_trade_band=args.meta_no_trade_band,
+            meta_use_xgboost=bool(args.meta_use_xgboost),
+            meta_prob_threshold=args.meta_prob_threshold,
+            meta_refit_interval=args.meta_refit_interval,
+            meta_train_window=meta_train_window,
+            sizing_scale=args.sizing_scale,
+            sizing_offset=args.sizing_offset,
+            sizing_min_size=args.sizing_min_size,
+            exit_time_bars=exit_time_bars,
+            exit_trail_stop=exit_trail_stop,
+            exit_min_hold_bars=args.exit_min_hold_bars,
         )
     if strategy_cls is CryptoRegimeTrendStrategy:
         return CryptoRegimeTrendStrategy(
@@ -413,8 +549,6 @@ def main() -> None:
 
     mode = "DRY RUN" if args.dry_run else "LIVE"
     if multi_asset_mode:
-        if args.asset_class != "stock":
-            raise SystemExit("Multi-asset mode currently supports stock symbols only.")
         logger.info(
             "Starting %s multi-asset trading: symbols=%s | strategy=%s | timeframe=%s",
             mode,
@@ -428,6 +562,7 @@ def main() -> None:
 
         trader = MultiAssetAlpacaTrader(
             symbols=resolved_symbols,
+            asset_class=args.asset_class,
             timeframe=args.timeframe,
             lookback=data_lookback,
             strategy_factory=strategy_factory,
@@ -493,7 +628,7 @@ def main() -> None:
             if multi_asset_mode:
                 out_dir = Path("data")
                 out_dir.mkdir(parents=True, exist_ok=True)
-                raw_path = out_dir / f"MULTI_{args.timeframe}_stock_live_raw.csv"
+                raw_path = out_dir / f"MULTI_{args.timeframe}_{args.asset_class}_live_raw.csv"
                 frame = df.copy()
                 if "Datetime" in frame.columns:
                     frame["Datetime"] = pd.to_datetime(

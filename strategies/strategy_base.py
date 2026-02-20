@@ -39,9 +39,22 @@ import numpy as np
 import pandas as pd
 
 try:
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.ensemble import (
+        ExtraTreesClassifier,
+        HistGradientBoostingClassifier,
+        RandomForestClassifier,
+    )
+    from sklearn.linear_model import LogisticRegression
 except Exception:  # pragma: no cover - optional dependency guard
     RandomForestClassifier = None  # type: ignore[assignment]
+    ExtraTreesClassifier = None  # type: ignore[assignment]
+    HistGradientBoostingClassifier = None  # type: ignore[assignment]
+    LogisticRegression = None  # type: ignore[assignment]
+
+try:
+    from xgboost import XGBClassifier
+except Exception:  # pragma: no cover - optional dependency guard
+    XGBClassifier = None  # type: ignore[assignment]
 
 
 class Strategy:
@@ -329,9 +342,12 @@ class CryptoCompetitionStrategy(Strategy):
         meta_min_samples_leaf: int = 15,
         meta_max_features: str = "sqrt",
         meta_prob_threshold: float = 0.50,
+        meta_no_trade_band: float = 0.03,
         meta_min_train_samples: int = 300,
         meta_refit_interval: int = 120,
         meta_train_window: int | None = 3000,
+        meta_calibration_frac: float = 0.20,
+        meta_use_xgboost: bool = False,
         sizing_scale: float = 1.5,
         sizing_offset: float = 0.3,
         sizing_vol_exponent: float = 0.75,
@@ -354,6 +370,8 @@ class CryptoCompetitionStrategy(Strategy):
             raise ValueError("volatility_quantile must be in (0, 1].")
         if meta_prob_threshold <= 0.0 or meta_prob_threshold >= 1.0:
             raise ValueError("meta_prob_threshold must be in (0, 1).")
+        if meta_no_trade_band < 0.0 or meta_no_trade_band >= 0.5:
+            raise ValueError("meta_no_trade_band must be in [0, 0.5).")
         if meta_n_estimators < 10:
             raise ValueError("meta_n_estimators must be at least 10.")
         if meta_max_depth < 2:
@@ -368,6 +386,8 @@ class CryptoCompetitionStrategy(Strategy):
             raise ValueError(
                 "meta_train_window must be >= meta_min_train_samples when provided."
             )
+        if meta_calibration_frac <= 0.0 or meta_calibration_frac >= 0.5:
+            raise ValueError("meta_calibration_frac must be in (0, 0.5).")
         if sizing_scale <= 0.0:
             raise ValueError("sizing_scale must be positive.")
         if sizing_vol_exponent <= 0.0:
@@ -382,7 +402,12 @@ class CryptoCompetitionStrategy(Strategy):
             raise ValueError("exit_min_hold_bars must be non-negative.")
         if position_size <= 0:
             raise ValueError("position_size must be positive.")
-        if RandomForestClassifier is None:
+        if (
+            RandomForestClassifier is None
+            or ExtraTreesClassifier is None
+            or HistGradientBoostingClassifier is None
+            or LogisticRegression is None
+        ):
             raise ImportError(
                 "CryptoCompetitionStrategy requires scikit-learn. "
                 "Install dependencies from requirements.txt."
@@ -405,9 +430,12 @@ class CryptoCompetitionStrategy(Strategy):
         self.meta_min_samples_leaf = meta_min_samples_leaf
         self.meta_max_features = meta_max_features
         self.meta_prob_threshold = meta_prob_threshold
+        self.meta_no_trade_band = meta_no_trade_band
         self.meta_min_train_samples = meta_min_train_samples
         self.meta_refit_interval = meta_refit_interval
         self.meta_train_window = meta_train_window
+        self.meta_calibration_frac = meta_calibration_frac
+        self.meta_use_xgboost = bool(meta_use_xgboost)
 
         self.sizing_scale = sizing_scale
         self.sizing_offset = sizing_offset
@@ -427,8 +455,7 @@ class CryptoCompetitionStrategy(Strategy):
     def _reset_meta_cache(self) -> None:
         self._meta_cache_index: pd.Index | None = None
         self._meta_cache_probs: np.ndarray = np.array([], dtype=float)
-        self._meta_cache_model: RandomForestClassifier | None = None
-        self._meta_cache_const_prob: float = 0.5
+        self._meta_cache_bundle: dict[str, object] | None = None
         self._meta_cache_last_refit_bar: int = -10**9
 
     @property
@@ -512,19 +539,100 @@ class CryptoCompetitionStrategy(Strategy):
         ).astype(float)
         return df
 
-    def _fit_meta_model(
+    def _meta_model_names(self) -> list[str]:
+        names = ["rf", "et", "hgb"]
+        if self.meta_use_xgboost and XGBClassifier is not None:
+            names.append("xgb")
+        return names
+
+    def _fit_single_meta_model(
         self,
-        train_df: pd.DataFrame,
-    ) -> tuple[RandomForestClassifier | None, float]:
+        model_name: str,
+        X: np.ndarray,
+        y: np.ndarray,
+        *,
+        seed: int,
+    ) -> object | None:
+        if model_name == "rf":
+            model = RandomForestClassifier(
+                n_estimators=int(self.meta_n_estimators),
+                max_depth=int(self.meta_max_depth),
+                min_samples_leaf=int(self.meta_min_samples_leaf),
+                max_features=self.meta_max_features,
+                random_state=int(seed),
+            )
+        elif model_name == "et":
+            model = ExtraTreesClassifier(
+                n_estimators=int(self.meta_n_estimators),
+                max_depth=int(self.meta_max_depth),
+                min_samples_leaf=int(self.meta_min_samples_leaf),
+                max_features=self.meta_max_features,
+                random_state=int(seed),
+            )
+        elif model_name == "hgb":
+            model = HistGradientBoostingClassifier(
+                max_iter=max(80, int(self.meta_n_estimators)),
+                max_depth=int(self.meta_max_depth),
+                min_samples_leaf=int(self.meta_min_samples_leaf),
+                learning_rate=0.05,
+                random_state=int(seed),
+            )
+        elif model_name == "xgb":
+            if XGBClassifier is None:
+                return None
+            model = XGBClassifier(
+                n_estimators=int(self.meta_n_estimators),
+                max_depth=int(self.meta_max_depth),
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.8,
+                min_child_weight=1,
+                objective="binary:logistic",
+                eval_metric="logloss",
+                random_state=int(seed),
+                n_jobs=1,
+                verbosity=0,
+            )
+        else:
+            return None
+        try:
+            model.fit(X, y.astype(int))
+        except Exception:
+            return None
+        return model
+
+    def _predict_meta_model(self, model: object, X: np.ndarray) -> np.ndarray:
+        try:
+            p = np.asarray(model.predict_proba(X)[:, 1], dtype=float)
+        except Exception:
+            return np.full(len(X), 0.5, dtype=float)
+        return np.clip(p, 1e-6, 1.0 - 1e-6)
+
+    def _fit_meta_model(self, train_df: pd.DataFrame) -> dict[str, object]:
         if train_df.empty:
-            return None, 0.5
+            return {
+                "models": [],
+                "weights": np.array([], dtype=float),
+                "stacker": None,
+                "const_prob": 0.5,
+            }
 
         y = (train_df["fwd_ret"].values > 0.0).astype(int)
         positive_rate = float(y.mean()) if len(y) else 0.5
         if len(train_df) < self.meta_min_train_samples:
-            return None, positive_rate
+            return {
+                "models": [],
+                "weights": np.array([], dtype=float),
+                "stacker": None,
+                "const_prob": positive_rate,
+            }
         if positive_rate <= 0.01 or positive_rate >= 0.99:
-            return None, positive_rate
+            return {
+                "models": [],
+                "weights": np.array([], dtype=float),
+                "stacker": None,
+                "const_prob": positive_rate,
+            }
 
         X = (
             train_df[list(self.META_FEATURE_COLS)]
@@ -533,18 +641,90 @@ class CryptoCompetitionStrategy(Strategy):
             .values.astype(float)
         )
         X = np.clip(X, -50.0, 50.0)
-        model = RandomForestClassifier(
-            n_estimators=int(self.meta_n_estimators),
-            max_depth=int(self.meta_max_depth),
-            min_samples_leaf=int(self.meta_min_samples_leaf),
-            max_features=self.meta_max_features,
-            random_state=42,
-        )
-        try:
-            model.fit(X, y)
-        except Exception:
-            return None, positive_rate
-        return model, positive_rate
+
+        n = len(train_df)
+        min_cal = max(60, int(self.meta_min_train_samples // 4))
+        split = int(n * (1.0 - float(self.meta_calibration_frac)))
+        split = max(int(self.meta_min_train_samples), min(split, n - min_cal))
+        if split <= 0 or split >= n:
+            split = int(n * 0.8)
+        if split <= 0 or split >= n:
+            split = n
+
+        if split < n:
+            X_fit, y_fit = X[:split], y[:split]
+            X_cal, y_cal = X[split:], y[split:]
+        else:
+            X_fit, y_fit = X, y
+            X_cal, y_cal = X, y
+
+        models: list[tuple[str, object]] = []
+        for k, name in enumerate(self._meta_model_names()):
+            model = self._fit_single_meta_model(name, X_fit, y_fit, seed=42 + 11 * k)
+            if model is not None:
+                models.append((name, model))
+
+        if not models:
+            return {
+                "models": [],
+                "weights": np.array([], dtype=float),
+                "stacker": None,
+                "const_prob": positive_rate,
+            }
+
+        pred_cols: list[np.ndarray] = []
+        inv_losses: list[float] = []
+        for _, model in models:
+            p = self._predict_meta_model(model, X_cal)
+            pred_cols.append(p)
+            brier = float(np.mean((p - y_cal) ** 2))
+            inv_losses.append(1.0 / max(brier, 1e-6))
+
+        weights = np.asarray(inv_losses, dtype=float)
+        if not np.isfinite(weights).all() or float(weights.sum()) <= 0:
+            weights = np.ones(len(models), dtype=float)
+        weights = weights / float(weights.sum())
+
+        stacker: LogisticRegression | None = None
+        if len(models) >= 2 and len(y_cal) >= 80 and len(np.unique(y_cal)) >= 2:
+            Z = np.vstack(pred_cols).T
+            try:
+                stacker = LogisticRegression(max_iter=200, solver="lbfgs")
+                stacker.fit(Z, y_cal.astype(int))
+            except Exception:
+                stacker = None
+
+        return {
+            "models": models,
+            "weights": weights,
+            "stacker": stacker,
+            "const_prob": positive_rate,
+        }
+
+    def _predict_meta_bundle(self, X_row: np.ndarray, bundle: dict[str, object]) -> float:
+        models = bundle.get("models", [])
+        if not isinstance(models, list) or not models:
+            return float(bundle.get("const_prob", 0.5))
+
+        weights = np.asarray(bundle.get("weights", np.array([], dtype=float)), dtype=float)
+        if len(weights) != len(models) or float(weights.sum()) <= 0:
+            weights = np.ones(len(models), dtype=float) / float(len(models))
+
+        preds: list[float] = []
+        for _, model in models:
+            p = self._predict_meta_model(model, X_row)
+            preds.append(float(p[0]) if len(p) else 0.5)
+        pred_vec = np.asarray(preds, dtype=float)
+        weighted = float(np.dot(weights, pred_vec))
+
+        stacker = bundle.get("stacker")
+        if stacker is not None and len(pred_vec) >= 2:
+            try:
+                stacked = float(stacker.predict_proba(pred_vec.reshape(1, -1))[0, 1])
+                weighted = 0.6 * weighted + 0.4 * stacked
+            except Exception:
+                pass
+        return float(np.clip(weighted, 1e-6, 1.0 - 1e-6))
 
     def _compute_causal_meta_prob(self, df: pd.DataFrame) -> pd.Series:
         n = len(df)
@@ -577,25 +757,22 @@ class CryptoCompetitionStrategy(Strategy):
         if incremental:
             probs_np = np.concatenate([self._meta_cache_probs, np.array([0.5])])
             start_i = n - 1
-            model = self._meta_cache_model
-            const_prob = float(self._meta_cache_const_prob)
+            bundle = self._meta_cache_bundle
             last_refit = int(self._meta_cache_last_refit_bar)
         elif sliding_incremental:
             probs_np = np.concatenate([self._meta_cache_probs[1:], np.array([0.5])])
             start_i = n - 1
-            model = self._meta_cache_model
-            const_prob = float(self._meta_cache_const_prob)
+            bundle = self._meta_cache_bundle
             # Window shifted by one bar, so rebase refit pointer by -1.
             last_refit = int(self._meta_cache_last_refit_bar) - 1
         else:
             probs_np = np.full(n, 0.5, dtype=float)
             start_i = 0
-            model = None
-            const_prob = 0.5
+            bundle = None
             last_refit = -10**9
 
         for i in range(start_i, n):
-            if model is None or (i - last_refit) >= self.meta_refit_interval:
+            if bundle is None or (i - last_refit) >= self.meta_refit_interval:
                 lo = 0
                 if self.meta_train_window is not None:
                     lo = max(0, i - int(self.meta_train_window))
@@ -611,7 +788,7 @@ class CryptoCompetitionStrategy(Strategy):
                     train_df = train_block.loc[valid_train]
                 else:
                     train_df = train_block
-                model, const_prob = self._fit_meta_model(train_df)
+                bundle = self._fit_meta_model(train_df)
                 last_refit = i
 
             row = (
@@ -621,16 +798,15 @@ class CryptoCompetitionStrategy(Strategy):
                 .values.astype(float)
             )
             row = np.clip(row, -50.0, 50.0).reshape(1, -1)
-            if model is None:
-                p = float(const_prob)
+            if bundle is None:
+                p = 0.5
             else:
-                p = float(model.predict_proba(row)[0, 1])
+                p = self._predict_meta_bundle(row, bundle)
             probs_np[i] = float(np.clip(p, 1e-6, 1.0 - 1e-6))
 
         self._meta_cache_index = df.index.copy()
         self._meta_cache_probs = probs_np.copy()
-        self._meta_cache_model = model
-        self._meta_cache_const_prob = float(const_prob)
+        self._meta_cache_bundle = bundle
         self._meta_cache_last_refit_bar = int(last_refit)
         return pd.Series(probs_np, index=df.index, dtype=float)
 
@@ -731,10 +907,24 @@ class CryptoCompetitionStrategy(Strategy):
 
         return pd.Series(out, index=entry_gate.index, dtype=float)
 
+    def _hysteresis_meta_gate(self, prob: pd.Series) -> pd.Series:
+        lower = max(1e-6, float(self.meta_prob_threshold) - float(self.meta_no_trade_band))
+        upper = min(1.0 - 1e-6, float(self.meta_prob_threshold) + float(self.meta_no_trade_band))
+        out = np.zeros(len(prob), dtype=float)
+        state = False
+        vals = prob.fillna(0.5).astype(float).values
+        for i, p in enumerate(vals):
+            if p >= upper:
+                state = True
+            elif p <= lower:
+                state = False
+            out[i] = 1.0 if state else 0.0
+        return pd.Series(out, index=prob.index, dtype=float)
+
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
         df["quality_long"] = self._apply_quality_filter(df)
         df["meta_prob"] = self._compute_causal_meta_prob(df)
-        df["meta_long"] = (df["meta_prob"] > self.meta_prob_threshold).astype(float)
+        df["meta_long"] = self._hysteresis_meta_gate(df["meta_prob"])
 
         entry_gate = (
             (df["quality_long"] > 0.0) & (df["meta_long"] > 0.0)
@@ -758,6 +948,199 @@ class CryptoCompetitionStrategy(Strategy):
         df["position"] = 0
         df["desired_position_frac"] = position_frac.astype(float)
         return df
+
+
+class CryptoCompetitionPortfolioStrategy(CrossSectionalStrategy):
+    """
+    Multi-asset portfolio wrapper around CryptoCompetitionStrategy.
+
+    Each symbol gets its own causal model state. The strategy emits delta orders
+    toward target notional per symbol, where target notional is:
+
+        desired_position_frac * (portfolio_notional / active_symbols)
+
+    This matches the vectorized equal-weight portfolio spirit better than
+    per-symbol standalone sizing.
+    """
+
+    def __init__(
+        self,
+        portfolio_notional: float = 100_000.0,
+        allow_fractional_qty: bool = True,
+        min_order_notional: float = 5.0,
+        **competition_kwargs,
+    ):
+        if portfolio_notional <= 0:
+            raise ValueError("portfolio_notional must be positive.")
+        if min_order_notional < 0:
+            raise ValueError("min_order_notional must be non-negative.")
+
+        self.portfolio_notional = float(portfolio_notional)
+        self.allow_fractional_qty = bool(allow_fractional_qty)
+        self.min_order_notional = float(min_order_notional)
+
+        # Use per-symbol position_size=1 so desired_position_frac remains the
+        # sizing driver, while portfolio wrapper controls gross notional.
+        self._competition_kwargs = dict(competition_kwargs)
+        self._competition_kwargs["position_size"] = 1.0
+        self._strategy_by_symbol: dict[str, CryptoCompetitionStrategy] = {}
+        self._required_lookback = int(
+            CryptoCompetitionStrategy(**self._competition_kwargs).required_lookback
+        )
+
+    @property
+    def required_lookback(self) -> int:
+        return self._required_lookback
+
+    def _strategy_for_symbol(self, symbol: str) -> CryptoCompetitionStrategy:
+        sym = str(symbol).upper()
+        strategy = self._strategy_by_symbol.get(sym)
+        if strategy is None:
+            strategy = CryptoCompetitionStrategy(**self._competition_kwargs)
+            self._strategy_by_symbol[sym] = strategy
+        return strategy
+
+    @staticmethod
+    def _normalize_panel(panel_df: pd.DataFrame) -> pd.DataFrame:
+        panel = panel_df.copy()
+        rename: dict[str, str] = {}
+        for col in panel.columns:
+            key = str(col).strip().lower()
+            if key in {"datetime", "timestamp", "date", "time"}:
+                rename[col] = "Datetime"
+            elif key in {"symbol", "ticker"}:
+                rename[col] = "symbol"
+            elif key == "open":
+                rename[col] = "Open"
+            elif key == "high":
+                rename[col] = "High"
+            elif key == "low":
+                rename[col] = "Low"
+            elif key == "close":
+                rename[col] = "Close"
+            elif key == "volume":
+                rename[col] = "Volume"
+        if rename:
+            panel = panel.rename(columns=rename)
+
+        required = ["Datetime", "symbol", "Open", "High", "Low", "Close", "Volume"]
+        missing = [c for c in required if c not in panel.columns]
+        if missing:
+            raise ValueError(f"Panel data missing required columns: {missing}")
+
+        out = panel[required].copy()
+        out["Datetime"] = pd.to_datetime(out["Datetime"], utc=True, errors="coerce")
+        out["symbol"] = out["symbol"].astype(str).str.upper()
+        out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
+        out = out.dropna(subset=["Datetime", "symbol", "Close"])
+        return out.sort_values(["Datetime", "symbol"]).drop_duplicates(
+            ["Datetime", "symbol"], keep="last"
+        )
+
+    def _qty_from_notional_delta(self, delta_notional: float, close: float) -> float:
+        if close <= 0:
+            return 0.0
+        qty = abs(float(delta_notional)) / float(close)
+        if self.allow_fractional_qty:
+            qty = np.floor(qty * 1_000_000.0) / 1_000_000.0
+        else:
+            qty = float(int(qty))
+        return float(max(0.0, qty))
+
+    def run_panel(
+        self,
+        panel_df: pd.DataFrame,
+        current_positions: dict[str, float] | None = None,
+    ) -> pd.DataFrame:
+        empty = pd.DataFrame(columns=["symbol", "signal", "target_qty", "limit_price"])
+        if panel_df is None or panel_df.empty:
+            return empty
+
+        panel = self._normalize_panel(panel_df)
+        if panel.empty:
+            return empty
+
+        desired_frac_by_symbol: dict[str, float] = {}
+        close_by_symbol: dict[str, float] = {}
+
+        for symbol, sym_df in panel.groupby("symbol"):
+            sym = str(symbol).upper()
+            local = sym_df.sort_values("Datetime").copy()
+            if len(local) < self.required_lookback:
+                continue
+
+            strategy = self._strategy_for_symbol(sym)
+            out = strategy.run(local[["Datetime", "Open", "High", "Low", "Close", "Volume"]])
+            if out.empty:
+                continue
+
+            latest = out.iloc[-1]
+            close = float(latest.get("Close", np.nan))
+            if not np.isfinite(close) or close <= 0:
+                continue
+
+            frac_val = latest.get("desired_position_frac", np.nan)
+            if pd.notna(frac_val):
+                frac = float(np.clip(float(frac_val), 0.0, 1.0))
+            else:
+                signal = int(latest.get("signal", 0) or 0)
+                frac = 1.0 if signal > 0 else 0.0
+
+            desired_frac_by_symbol[sym] = frac
+            close_by_symbol[sym] = close
+
+        if not desired_frac_by_symbol:
+            return empty
+
+        active_symbols = sorted(desired_frac_by_symbol.keys())
+        per_symbol_budget = float(self.portfolio_notional) / float(len(active_symbols))
+
+        pos_map = {
+            str(k).upper(): float(v)
+            for k, v in (current_positions or {}).items()
+            if pd.notna(v)
+        }
+
+        rows: list[dict[str, float | int | str]] = []
+        for sym in active_symbols:
+            close = float(close_by_symbol[sym])
+            target_notional = float(desired_frac_by_symbol[sym]) * per_symbol_budget
+            current_qty = float(pos_map.get(sym, 0.0))
+            current_notional = current_qty * close
+            delta_notional = target_notional - current_notional
+
+            if abs(delta_notional) < float(self.min_order_notional):
+                continue
+
+            signal = 1 if delta_notional > 0 else -1
+            qty = self._qty_from_notional_delta(delta_notional, close)
+            if qty <= 0:
+                continue
+
+            if signal < 0:
+                # Long-only behavior for this crypto competition portfolio.
+                max_sell = max(0.0, current_qty)
+                qty = min(qty, max_sell)
+                if qty <= 0:
+                    continue
+
+            rows.append(
+                {
+                    "symbol": sym,
+                    "signal": int(signal),
+                    "target_qty": float(qty),
+                    "limit_price": float(close),
+                }
+            )
+
+        if not rows:
+            return empty
+        out = pd.DataFrame(rows)
+        out = out.dropna(subset=["symbol", "signal", "target_qty"])
+        out["signal"] = out["signal"].astype(int)
+        out["target_qty"] = out["target_qty"].astype(float)
+        out = out[out["target_qty"] > 0]
+        return out[["symbol", "signal", "target_qty", "limit_price"]]
 
 
 class CrossSectionalPaperReversalStrategy(CrossSectionalStrategy):

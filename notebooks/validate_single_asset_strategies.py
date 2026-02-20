@@ -218,10 +218,58 @@ def simulate_from_position(
     position: pd.Series,
     cost_bps: float,
     bars_per_year: int,
+    execution_model: str = "ideal",
+    random_seed: int = 42,
+    full_fill_prob: float = 0.70,
+    partial_fill_prob: float = 0.20,
+    partial_fill_min: float = 0.10,
+    partial_fill_max: float = 0.90,
 ) -> SimulationResult:
     close = close.astype(float)
     ret = close.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    pos = position.reindex(close.index).fillna(0.0).astype(float).clip(-1.0, 1.0)
+    target_pos = position.reindex(close.index).fillna(0.0).astype(float).clip(-1.0, 1.0)
+
+    mode = str(execution_model).strip().lower()
+    if mode not in {"ideal", "full_fill", "stochastic"}:
+        raise ValueError("execution_model must be one of: ideal, full_fill, stochastic")
+
+    if mode == "ideal":
+        pos = target_pos
+    else:
+        if full_fill_prob < 0.0 or partial_fill_prob < 0.0:
+            raise ValueError("fill probabilities must be non-negative.")
+        if (full_fill_prob + partial_fill_prob) > 1.0:
+            raise ValueError("full_fill_prob + partial_fill_prob must be <= 1.")
+        if partial_fill_min < 0.0 or partial_fill_max > 1.0 or partial_fill_min > partial_fill_max:
+            raise ValueError("partial_fill_min/max must satisfy 0 <= min <= max <= 1.")
+
+        rng = np.random.default_rng(int(random_seed))
+        executed = np.zeros(len(target_pos), dtype=float)
+        tgt = target_pos.values.astype(float)
+        prev = 0.0
+        for i in range(len(tgt)):
+            desired = float(tgt[i])
+            delta = desired - prev
+            if abs(delta) <= 1e-12:
+                executed[i] = prev
+                continue
+
+            if mode == "full_fill":
+                fill_ratio = 1.0
+            else:
+                r = float(rng.random())
+                if r < float(full_fill_prob):
+                    fill_ratio = 1.0
+                elif r < float(full_fill_prob + partial_fill_prob):
+                    fill_ratio = float(rng.uniform(float(partial_fill_min), float(partial_fill_max)))
+                else:
+                    fill_ratio = 0.0
+
+            prev = np.clip(prev + delta * fill_ratio, -1.0, 1.0)
+            executed[i] = prev
+
+        pos = pd.Series(executed, index=target_pos.index, dtype=float)
+
     bar_pos = pos.shift(1).fillna(0.0)
 
     gross = bar_pos * ret
