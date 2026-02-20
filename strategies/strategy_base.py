@@ -35,6 +35,7 @@ Example:
 
 from __future__ import annotations
 
+from collections import deque
 import numpy as np
 import pandas as pd
 
@@ -89,6 +90,25 @@ class Strategy:
         df = self.generate_signals(df)
         return df
 
+    def reset_incremental_state(self) -> None:
+        """
+        Optional hook used by backtests before incremental bar processing starts.
+        """
+        return None
+
+    def run_incremental(
+        self,
+        row: dict,
+        bar_index: int | None = None,
+    ) -> dict[str, float | int] | pd.Series | None:
+        """
+        Optional incremental bar update.
+
+        Return the latest signal payload (dict or Series) to avoid full DataFrame
+        recomputation, or None to fall back to run(df).
+        """
+        return None
+
 
 class CrossSectionalStrategy(Strategy):
     """Base class for portfolio strategies that operate on symbol panels."""
@@ -122,6 +142,19 @@ class MovingAverageStrategy(Strategy):
         self.short_window = short_window
         self.long_window = long_window
         self.position_size = position_size
+        self.reset_incremental_state()
+
+    @property
+    def required_lookback(self) -> int:
+        return max(int(self.long_window) + 2, 3)
+
+    def reset_incremental_state(self) -> None:
+        self._inc_short_vals: deque[float] = deque()
+        self._inc_long_vals: deque[float] = deque()
+        self._inc_short_sum = 0.0
+        self._inc_long_sum = 0.0
+        self._inc_prev_short_ma: float | None = None
+        self._inc_prev_long_ma: float | None = None
 
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df["MA_short"] = df["Close"].rolling(self.short_window, min_periods=1).mean()
@@ -149,6 +182,55 @@ class MovingAverageStrategy(Strategy):
         df["target_qty"] = df["position"].abs() * self.position_size
         return df
 
+    def run_incremental(
+        self,
+        row: dict,
+        bar_index: int | None = None,
+    ) -> dict[str, float | int]:
+        close = float(row.get("Close", np.nan))
+        if not np.isfinite(close):
+            return {
+                "Close": close,
+                "signal": 0,
+                "position": 0,
+                "target_qty": 0.0,
+            }
+
+        self._inc_short_vals.append(close)
+        self._inc_short_sum += close
+        if len(self._inc_short_vals) > int(self.short_window):
+            self._inc_short_sum -= float(self._inc_short_vals.popleft())
+
+        self._inc_long_vals.append(close)
+        self._inc_long_sum += close
+        if len(self._inc_long_vals) > int(self.long_window):
+            self._inc_long_sum -= float(self._inc_long_vals.popleft())
+
+        short_ma = self._inc_short_sum / float(len(self._inc_short_vals))
+        long_ma = self._inc_long_sum / float(len(self._inc_long_vals))
+
+        signal = 0
+        if self._inc_prev_short_ma is not None and self._inc_prev_long_ma is not None:
+            if self._inc_prev_short_ma <= self._inc_prev_long_ma and short_ma > long_ma:
+                signal = 1
+            elif self._inc_prev_short_ma >= self._inc_prev_long_ma and short_ma < long_ma:
+                signal = -1
+
+        position = 0
+        if short_ma > long_ma:
+            position = 1
+        elif short_ma < long_ma:
+            position = -1
+
+        self._inc_prev_short_ma = short_ma
+        self._inc_prev_long_ma = long_ma
+        return {
+            "Close": close,
+            "signal": int(signal),
+            "position": int(position),
+            "target_qty": float(abs(position) * self.position_size),
+        }
+
 
 class TemplateStrategy(Strategy):
     """
@@ -171,6 +253,15 @@ class TemplateStrategy(Strategy):
         self.position_size = position_size
         self.buy_threshold = buy_threshold
         self.sell_threshold = sell_threshold
+        self.reset_incremental_state()
+
+    @property
+    def required_lookback(self) -> int:
+        return max(int(self.lookback) + 2, 3)
+
+    def reset_incremental_state(self) -> None:
+        self._inc_closes: deque[float] = deque()
+        self._inc_position = 0.0
 
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df["momentum"] = df["Close"].pct_change(self.lookback).fillna(0.0)
@@ -189,6 +280,47 @@ class TemplateStrategy(Strategy):
         df["target_qty"] = df["position"].abs() * self.position_size
         return df
 
+    def run_incremental(
+        self,
+        row: dict,
+        bar_index: int | None = None,
+    ) -> dict[str, float | int]:
+        close = float(row.get("Close", np.nan))
+        if not np.isfinite(close):
+            return {
+                "Close": close,
+                "signal": 0,
+                "position": int(self._inc_position),
+                "target_qty": float(abs(self._inc_position) * self.position_size),
+            }
+
+        self._inc_closes.append(close)
+        max_keep = int(self.lookback) + 1
+        while len(self._inc_closes) > max_keep:
+            self._inc_closes.popleft()
+
+        momentum = 0.0
+        if len(self._inc_closes) > int(self.lookback):
+            base = float(self._inc_closes[0])
+            if abs(base) > 1e-12:
+                momentum = close / base - 1.0
+
+        signal = 0
+        if momentum > float(self.buy_threshold):
+            signal = 1
+        elif momentum < float(self.sell_threshold):
+            signal = -1
+
+        if signal != 0:
+            self._inc_position = float(signal)
+
+        return {
+            "Close": close,
+            "signal": int(signal),
+            "position": int(self._inc_position),
+            "target_qty": float(abs(self._inc_position) * self.position_size),
+        }
+
 
 class CryptoTrendStrategy(Strategy):
     """
@@ -205,6 +337,16 @@ class CryptoTrendStrategy(Strategy):
         self.short_window = short_window
         self.long_window = long_window
         self.position_size = position_size
+        self.reset_incremental_state()
+
+    @property
+    def required_lookback(self) -> int:
+        return max(int(self.long_window) + 2, 3)
+
+    def reset_incremental_state(self) -> None:
+        self._inc_ema_fast: float | None = None
+        self._inc_ema_slow: float | None = None
+        self._inc_prev_long_regime: bool | None = None
 
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df["EMA_fast"] = df["Close"].ewm(span=self.short_window, adjust=False).mean()
@@ -220,6 +362,49 @@ class CryptoTrendStrategy(Strategy):
         df["position"] = long_regime.astype(int)
         df["target_qty"] = self.position_size
         return df
+
+    def run_incremental(
+        self,
+        row: dict,
+        bar_index: int | None = None,
+    ) -> dict[str, float | int]:
+        close = float(row.get("Close", np.nan))
+        if not np.isfinite(close):
+            return {
+                "Close": close,
+                "signal": 0,
+                "position": 0,
+                "target_qty": 0.0,
+            }
+
+        if self._inc_ema_fast is None:
+            self._inc_ema_fast = close
+        else:
+            alpha_fast = 2.0 / (float(self.short_window) + 1.0)
+            self._inc_ema_fast = alpha_fast * close + (1.0 - alpha_fast) * self._inc_ema_fast
+
+        if self._inc_ema_slow is None:
+            self._inc_ema_slow = close
+        else:
+            alpha_slow = 2.0 / (float(self.long_window) + 1.0)
+            self._inc_ema_slow = alpha_slow * close + (1.0 - alpha_slow) * self._inc_ema_slow
+
+        long_regime = bool(self._inc_ema_fast > self._inc_ema_slow)
+        signal = 0
+        if self._inc_prev_long_regime is not None:
+            if not self._inc_prev_long_regime and long_regime:
+                signal = 1
+            elif self._inc_prev_long_regime and not long_regime:
+                signal = -1
+        self._inc_prev_long_regime = long_regime
+
+        position = 1 if long_regime else 0
+        return {
+            "Close": close,
+            "signal": int(signal),
+            "position": int(position),
+            "target_qty": float(self.position_size),
+        }
 
 
 class CryptoRegimeTrendStrategy(Strategy):
@@ -451,12 +636,60 @@ class CryptoCompetitionStrategy(Strategy):
         self.position_size = position_size
 
         self._reset_meta_cache()
+        self._reset_incremental_runtime()
+
+    def reset_incremental_state(self) -> None:
+        self._reset_meta_cache()
+        self._reset_incremental_runtime()
 
     def _reset_meta_cache(self) -> None:
         self._meta_cache_index: pd.Index | None = None
         self._meta_cache_probs: np.ndarray = np.array([], dtype=float)
         self._meta_cache_bundle: dict[str, object] | None = None
         self._meta_cache_last_refit_bar: int = -10**9
+
+    def _reset_incremental_runtime(self) -> None:
+        self._inc_bar_count = 0
+        self._inc_prev_close: float | None = None
+        self._inc_closes: deque[float] = deque(maxlen=31)
+        self._inc_ema_fast: float | None = None
+        self._inc_ema_slow: float | None = None
+        self._inc_ema_slow_hist: deque[float] = deque(
+            maxlen=int(self.slope_lookback) + 1
+        )
+        self._inc_ret1_window: deque[float] = deque(maxlen=int(self.volatility_window))
+        self._inc_realized_vol_window: deque[float] = deque(
+            maxlen=int(self.volatility_window)
+        )
+        self._inc_spread_window: deque[float] = deque(maxlen=720)
+
+        self._inc_meta_rows: list[dict[str, float | bool]] = []
+        meta_cap = int(self.required_lookback)
+        if self.meta_train_window is not None:
+            meta_cap = min(meta_cap, int(self.meta_train_window))
+        self._inc_meta_max_rows = max(2, meta_cap + 1)
+        self._inc_meta_bundle: dict[str, object] | None = None
+        self._inc_meta_last_refit_bar: int = -10**9
+        self._inc_meta_state = False
+
+        self._inc_size_ewm: float | None = None
+
+        self._inc_in_pos = False
+        self._inc_held_size = 0.0
+        self._inc_hold = 0
+        self._inc_peak = 0.0
+        self._inc_entry_price = 0.0
+        self._inc_lock_until_reset = False
+        self._inc_prev_desired_notional = 0.0
+
+    @staticmethod
+    def _inc_nanquantile(values: deque[float], q: float, min_count: int) -> float:
+        arr = np.asarray(
+            [float(x) for x in values if np.isfinite(float(x))], dtype=float
+        )
+        if len(arr) < int(min_count):
+            return float("nan")
+        return float(np.quantile(arr, float(q)))
 
     @property
     def required_lookback(self) -> int:
@@ -948,6 +1181,315 @@ class CryptoCompetitionStrategy(Strategy):
         df["position"] = 0
         df["desired_position_frac"] = position_frac.astype(float)
         return df
+
+    def run_incremental(
+        self,
+        row: dict,
+        bar_index: int | None = None,
+    ) -> dict[str, float | int]:
+        i = int(self._inc_bar_count if bar_index is None else bar_index)
+        close = float(row.get("Close", np.nan))
+        if not np.isfinite(close):
+            self._inc_bar_count = i + 1
+            return {
+                "Close": close,
+                "signal": 0,
+                "target_qty": 0.0,
+                "position": 0,
+                "desired_position_frac": 0.0,
+            }
+
+        prev_close = self._inc_prev_close
+        if prev_close is not None and np.isfinite(prev_close) and abs(prev_close) > 1e-12:
+            ret1 = float(close / prev_close - 1.0)
+            prev_fwd_ret = ret1
+        else:
+            ret1 = 0.0
+            prev_fwd_ret = float("nan")
+
+        if self._inc_meta_rows:
+            self._inc_meta_rows[-1]["fwd_ret"] = prev_fwd_ret
+
+        if len(self._inc_closes) >= 5 and abs(float(self._inc_closes[-5])) > 1e-12:
+            ret5 = float(close / float(self._inc_closes[-5]) - 1.0)
+        else:
+            ret5 = 0.0
+        if len(self._inc_closes) >= 30 and abs(float(self._inc_closes[-30])) > 1e-12:
+            ret30 = float(close / float(self._inc_closes[-30]) - 1.0)
+        else:
+            ret30 = 0.0
+
+        if self._inc_ema_fast is None:
+            self._inc_ema_fast = close
+        else:
+            alpha_fast = 2.0 / (float(self.short_window) + 1.0)
+            self._inc_ema_fast = (
+                alpha_fast * close + (1.0 - alpha_fast) * float(self._inc_ema_fast)
+            )
+        if self._inc_ema_slow is None:
+            self._inc_ema_slow = close
+        else:
+            alpha_slow = 2.0 / (float(self.long_window) + 1.0)
+            self._inc_ema_slow = (
+                alpha_slow * close + (1.0 - alpha_slow) * float(self._inc_ema_slow)
+            )
+
+        ema_fast = float(self._inc_ema_fast)
+        ema_slow = float(self._inc_ema_slow)
+        self._inc_ema_slow_hist.append(ema_slow)
+        if len(self._inc_ema_slow_hist) > int(self.slope_lookback):
+            slope_base = float(self._inc_ema_slow_hist[0])
+            if np.isfinite(slope_base) and abs(slope_base) > 1e-12:
+                ema_slow_slope = float(ema_slow / slope_base - 1.0)
+            else:
+                ema_slow_slope = 0.0
+        else:
+            ema_slow_slope = 0.0
+
+        self._inc_ret1_window.append(float(ret1))
+        min_vol_samples = max(20, int(self.volatility_window) // 3)
+        min_q_samples = max(50, int(self.volatility_window) // 2)
+        ret1_arr = np.asarray(
+            [float(x) for x in self._inc_ret1_window if np.isfinite(float(x))], dtype=float
+        )
+        if len(ret1_arr) >= min_vol_samples and len(ret1_arr) > 1:
+            realized_vol = float(np.std(ret1_arr, ddof=1))
+        else:
+            realized_vol = float("nan")
+
+        vol_gate_threshold = self._inc_nanquantile(
+            self._inc_realized_vol_window,
+            q=float(self.volatility_quantile),
+            min_count=min_q_samples,
+        )
+        vol_med_threshold = self._inc_nanquantile(
+            self._inc_realized_vol_window,
+            q=0.5,
+            min_count=min_q_samples,
+        )
+        vol_ok = bool(
+            np.isfinite(realized_vol)
+            and np.isfinite(vol_gate_threshold)
+            and realized_vol <= vol_gate_threshold
+        )
+        self._inc_realized_vol_window.append(float(realized_vol))
+
+        if abs(ema_slow) > 1e-12:
+            spread = float((ema_fast - ema_slow) / ema_slow)
+        else:
+            spread = float("nan")
+        self._inc_spread_window.append(spread)
+        spread_arr = np.asarray(
+            [float(x) for x in self._inc_spread_window if np.isfinite(float(x))], dtype=float
+        )
+        if len(spread_arr) >= 100 and np.isfinite(spread):
+            spread_mean = float(np.mean(spread_arr))
+            spread_std = float(np.std(spread_arr, ddof=1)) if len(spread_arr) > 1 else float("nan")
+            if np.isfinite(spread_std):
+                spread_z = float((spread - spread_mean) / (spread_std + 1e-12))
+            else:
+                spread_z = float("nan")
+        else:
+            spread_z = float("nan")
+
+        if np.isfinite(realized_vol):
+            trend_tstat = float(abs(ema_fast - ema_slow) / (close * realized_vol + 1e-12))
+        else:
+            trend_tstat = float("nan")
+
+        if np.isfinite(realized_vol) and np.isfinite(vol_gate_threshold):
+            vol_ratio = float(realized_vol / (vol_gate_threshold + 1e-12))
+        else:
+            vol_ratio = float("nan")
+
+        trend_pre = bool(ema_fast > ema_slow)
+        base_long = float(trend_pre and (ema_slow_slope > 0.0) and vol_ok)
+
+        quality_on = bool(base_long > 0.0)
+        quality_on = quality_on and bool(
+            np.isfinite(spread_z) and spread_z > float(self.spread_z_threshold)
+        )
+        quality_on = quality_on and bool(
+            np.isfinite(trend_tstat) and trend_tstat > float(self.trend_tstat_threshold)
+        )
+        quality_on = quality_on and bool(
+            np.isfinite(vol_ratio) and vol_ratio <= float(self.vol_ratio_max)
+        )
+        if self.require_ret30_positive:
+            quality_on = quality_on and bool(np.isfinite(ret30) and ret30 > 0.0)
+        if self.require_ret5_positive:
+            quality_on = quality_on and bool(np.isfinite(ret5) and ret5 > 0.0)
+        quality_long = 1.0 if quality_on else 0.0
+
+        current_meta_row: dict[str, float | bool] = {
+            "spread_z": float(spread_z),
+            "EMA_slow_slope": float(ema_slow_slope),
+            "vol_ratio": float(vol_ratio),
+            "ret1": float(ret1),
+            "ret5": float(ret5),
+            "ret30": float(ret30),
+            "trend_tstat": float(trend_tstat),
+            "trend_pre": bool(trend_pre),
+            "fwd_ret": float("nan"),
+        }
+        self._inc_meta_rows.append(current_meta_row)
+        while len(self._inc_meta_rows) > int(self._inc_meta_max_rows):
+            self._inc_meta_rows.pop(0)
+
+        if self._inc_meta_bundle is None or (i - self._inc_meta_last_refit_bar) >= int(
+            self.meta_refit_interval
+        ):
+            train_rows = self._inc_meta_rows[:-1]
+            if self.meta_train_window is not None and len(train_rows) > int(
+                self.meta_train_window
+            ):
+                train_rows = train_rows[-int(self.meta_train_window) :]
+            if train_rows:
+                train_df = pd.DataFrame(train_rows)
+                valid_train = (
+                    train_df["trend_pre"].astype(bool)
+                    & train_df[list(self.META_FEATURE_COLS)]
+                    .replace([np.inf, -np.inf], np.nan)
+                    .notna()
+                    .all(axis=1)
+                    & train_df["fwd_ret"].notna()
+                )
+                train_df = train_df.loc[valid_train]
+            else:
+                train_df = pd.DataFrame(
+                    columns=["trend_pre", "fwd_ret", *list(self.META_FEATURE_COLS)]
+                )
+            self._inc_meta_bundle = self._fit_meta_model(train_df)
+            self._inc_meta_last_refit_bar = i
+
+        row_vec = np.asarray(
+            [current_meta_row.get(col, np.nan) for col in self.META_FEATURE_COLS], dtype=float
+        )
+        row_vec = np.clip(np.nan_to_num(row_vec, nan=0.0), -50.0, 50.0).reshape(1, -1)
+        if self._inc_meta_bundle is None:
+            meta_prob = 0.5
+        else:
+            meta_prob = float(self._predict_meta_bundle(row_vec, self._inc_meta_bundle))
+        meta_prob = float(np.clip(meta_prob, 1e-6, 1.0 - 1e-6))
+
+        lower = max(
+            1e-6, float(self.meta_prob_threshold) - float(self.meta_no_trade_band)
+        )
+        upper = min(
+            1.0 - 1e-6, float(self.meta_prob_threshold) + float(self.meta_no_trade_band)
+        )
+        if meta_prob >= upper:
+            self._inc_meta_state = True
+        elif meta_prob <= lower:
+            self._inc_meta_state = False
+        meta_long = 1.0 if self._inc_meta_state else 0.0
+
+        entry_gate = bool((quality_long > 0.0) and (meta_long > 0.0))
+
+        strength = (
+            max(0.0, float(spread_z) - float(self.sizing_offset))
+            if np.isfinite(spread_z)
+            else 0.0
+        )
+        vr = float(np.clip(vol_ratio, 0.5, 5.0)) if np.isfinite(vol_ratio) else 1.0
+        size_raw = float(
+            np.clip(
+                float(self.sizing_scale) * strength / (vr ** float(self.sizing_vol_exponent)),
+                0.0,
+                1.0,
+            )
+        )
+        if int(self.sizing_smooth_span) > 1:
+            alpha = 2.0 / (float(self.sizing_smooth_span) + 1.0)
+            if self._inc_size_ewm is None:
+                self._inc_size_ewm = size_raw
+            else:
+                self._inc_size_ewm = alpha * size_raw + (1.0 - alpha) * float(
+                    self._inc_size_ewm
+                )
+            size = float(self._inc_size_ewm)
+        else:
+            self._inc_size_ewm = size_raw
+            size = size_raw
+        if size < float(self.sizing_min_size):
+            size = 0.0
+
+        if not entry_gate:
+            self._inc_lock_until_reset = False
+
+        if not self._inc_in_pos:
+            if entry_gate and not self._inc_lock_until_reset:
+                self._inc_in_pos = True
+                self._inc_held_size = float(size)
+                self._inc_hold = 0
+                self._inc_peak = float(close)
+                self._inc_entry_price = float(close)
+        else:
+            self._inc_hold += 1
+            if close > self._inc_peak:
+                self._inc_peak = float(close)
+            exit_now = False
+            forced_exit = False
+            if not entry_gate:
+                exit_now = True
+            else:
+                if self._inc_hold >= int(max(0, self.exit_min_hold_bars)):
+                    if (
+                        self.exit_mode in {"time", "combo"}
+                        and self.exit_time_bars is not None
+                        and self._inc_hold >= int(self.exit_time_bars)
+                    ):
+                        exit_now = True
+                        forced_exit = True
+                    if (
+                        self.exit_mode in {"trail", "combo"}
+                        and self.exit_trail_stop is not None
+                        and self._inc_peak > 0
+                    ):
+                        drawdown = float(close / self._inc_peak - 1.0)
+                        if drawdown <= -float(self.exit_trail_stop):
+                            exit_now = True
+                            forced_exit = True
+                    if self.exit_profit_take is not None and self._inc_entry_price > 0:
+                        pnl = float(close / self._inc_entry_price - 1.0)
+                        if pnl >= float(self.exit_profit_take):
+                            exit_now = True
+                            forced_exit = True
+            if exit_now:
+                self._inc_in_pos = False
+                self._inc_held_size = 0.0
+                self._inc_hold = 0
+                self._inc_peak = 0.0
+                self._inc_entry_price = 0.0
+                if forced_exit:
+                    self._inc_lock_until_reset = True
+
+        position_frac = float(self._inc_held_size if self._inc_in_pos else 0.0)
+        desired_notional = float(position_frac * float(self.position_size))
+        delta = float(desired_notional - float(self._inc_prev_desired_notional))
+        self._inc_prev_desired_notional = desired_notional
+
+        eps = 1e-9
+        signal = 0
+        if delta > eps:
+            signal = 1
+        elif delta < -eps:
+            signal = -1
+
+        self._inc_closes.append(float(close))
+        self._inc_prev_close = float(close)
+        self._inc_bar_count = i + 1
+
+        return {
+            "Close": float(close),
+            "signal": int(signal),
+            "target_qty": float(abs(delta)),
+            "position": 0,
+            "desired_position_frac": float(position_frac),
+            "quality_long": float(quality_long),
+            "meta_prob": float(meta_prob),
+            "meta_long": float(meta_long),
+        }
 
 
 class CryptoCompetitionPortfolioStrategy(CrossSectionalStrategy):
