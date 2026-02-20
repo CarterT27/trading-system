@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from core.asset_eligibility import (
+    evaluate_asset_eligibility,
+    normalize_asset_flags_by_symbol,
+)
 from core.gateway import MarketDataGateway
 from core.matching_engine import MatchingEngine
 from core.order_book import Order, OrderBook
@@ -45,6 +49,7 @@ class Backtester:
         default_position_size: int = 10,
         verbose: bool = True,
         paper_parity: Optional[PaperParityConfig] = None,
+        asset_flags_by_symbol: Optional[Dict[str, object]] = None,
     ):
         self.data_gateway = data_gateway
         self.strategy = strategy
@@ -55,6 +60,7 @@ class Backtester:
         self.default_position_size = default_position_size
         self.verbose = verbose
         self.paper_parity = normalize_paper_parity_config(paper_parity)
+        self.asset_flags_by_symbol = normalize_asset_flags_by_symbol(asset_flags_by_symbol)
 
         self.market_history: List[Dict] = []
         self.equity_curve: List[float] = []
@@ -150,6 +156,16 @@ class Backtester:
         )
 
     def _submit_order(self, order: Order, timestamp: pd.Timestamp, quantity: int) -> None:
+        reserved = self.order_manager.reserved_for_order(order.order_id)
+        if reserved > 0:
+            self._log(
+                "reservation",
+                {
+                    "action": "reserve",
+                    "order_id": order.order_id,
+                    "amount": reserved,
+                },
+            )
         self.order_book.add_order(order)
         self._log("submitted", order.__dict__)
 
@@ -181,6 +197,24 @@ class Backtester:
                 self.order_manager.record_execution(order, filled_qty, trade["price"])
                 self._print_trade(order, filled_qty, trade["price"], timestamp, status)
 
+            released = self.order_manager.reconcile_reservation(
+                order,
+                filled_qty=filled_qty,
+                status=status,
+                reference_price=float(trade["price"]),
+                paper_parity=self.paper_parity,
+            )
+            if released > 0:
+                self._log(
+                    "reservation",
+                    {
+                        "action": "release",
+                        "order_id": order.order_id,
+                        "amount": released,
+                        "status": status,
+                    },
+                )
+
             self.trades.append(
                 TradeRecord(
                     timestamp=timestamp,
@@ -191,6 +225,17 @@ class Backtester:
                     pnl=realized,
                 )
             )
+
+    def _asset_eligibility(self, order: Order) -> tuple[bool, str]:
+        symbol = str(getattr(self.data_gateway, "symbol", "ASSET")).upper()
+        return evaluate_asset_eligibility(
+            symbol=symbol,
+            side=order.side,
+            qty=order.qty,
+            current_position=self.order_manager.net_position,
+            parity=self.paper_parity,
+            asset_flags_by_symbol=self.asset_flags_by_symbol,
+        )
 
     # ------------------------------------------------------------------- main
 
@@ -238,7 +283,15 @@ class Backtester:
 
                 for sig, px, qty in orders_to_submit:
                     order = self._create_order(sig, px, timestamp, qty)
-                    valid, reason = self.order_manager.validate(order)
+                    eligible, reason = self._asset_eligibility(order)
+                    if not eligible:
+                        self._log("rejected", {"order_id": order.order_id, "reason": reason})
+                        continue
+                    valid, reason = self.order_manager.validate(
+                        order,
+                        reference_price=float(latest["Close"]),
+                        paper_parity=self.paper_parity,
+                    )
                     if not valid:
                         self._log("rejected", {"order_id": order.order_id, "reason": reason})
                         continue
@@ -260,7 +313,15 @@ class Backtester:
             qty = int(qty_value) if pd.notna(qty_value) and qty_value > 0 else self.default_position_size
 
             order = self._create_order(signal, price, timestamp, qty)
-            valid, reason = self.order_manager.validate(order)
+            eligible, reason = self._asset_eligibility(order)
+            if not eligible:
+                self._log("rejected", {"order_id": order.order_id, "reason": reason})
+                continue
+            valid, reason = self.order_manager.validate(
+                order,
+                reference_price=float(latest["Close"]),
+                paper_parity=self.paper_parity,
+            )
             if not valid:
                 self._log("rejected", {"order_id": order.order_id, "reason": reason})
                 continue

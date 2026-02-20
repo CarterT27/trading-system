@@ -1,6 +1,6 @@
 # Backtest vs Alpaca Paper (Free/Basic) Parity Map
 
-Last verified: **February 19, 2026**.
+Last verified: **February 20, 2026**.
 
 This document maps the current behavior of this repository against Alpaca paper trading on the free/basic plan, with emphasis on:
 - what can be shorted,
@@ -15,14 +15,20 @@ This document maps the current behavior of this repository against Alpaca paper 
 ## Direct answers
 
 ### What can we short?
-- **Single-symbol backtest**: any symbol present in your CSV (no borrow/asset-status checks).
-- **Multi-asset backtest**: any symbol in panel data (no borrow/asset-status checks).
+- **Single-symbol backtest**:
+  - default mode: any symbol present in your CSV.
+  - parity mode (`--paper-parity` + optional `--asset-flags-csv`): enforces `tradable` and opening-short checks (`shortable`, optional `easy_to_borrow`).
+- **Multi-asset backtest**:
+  - default mode: any symbol in panel data.
+  - parity mode: same eligibility checks as single-symbol mode.
 - **Alpaca paper (equities)**: shorting is allowed only when account/asset constraints pass (margin-enabled account, asset shortable/borrowable rules).
 - **Alpaca paper (crypto)**: no shorting.
 
 ### How much can we short?
 - **Single-symbol backtest**: capped by local engine max short position (default 1,000 shares in `run_backtest.py`).
-- **Multi-asset backtest**: no explicit short cap by default (optional notional cap exists in engine but is not wired through `run_backtest.py` CLI).
+- **Multi-asset backtest**:
+  - supports `--max-short-notional` and `--max-notional-per-order`.
+  - parity mode also applies short-open buying-power checks using the 1.03 valuation rule.
 - **Alpaca paper**: constrained by buying power and margin rules. Alpaca checks opening short order value against buying power and applies margin/PDT protections.
 
 #### Alpaca short sizing constraints to model
@@ -40,10 +46,10 @@ This document maps the current behavior of this repository against Alpaca paper 
 
 | Topic | Current backtest behavior | Alpaca paper (free/basic) behavior | Parity risk |
 |---|---|---|---|
-| Tradable universe | Trades whatever is in CSV/panel. | Asset must be active/tradable in Alpaca assets model. | Backtest can trade symbols paper rejects. |
-| Short eligibility | No `shortable`/`easy_to_borrow` checks. | New shorts depend on short/margin eligibility and borrow status. | Backtest can overstate short opportunity set. |
-| Short sizing | Single-symbol uses local max short shares; multi-asset has no explicit short cap by default. | Short opens consume buying power and are margin constrained. | Backtest can over-size shorts. |
-| Buying power checks | Simplified local cash/position logic; no Alpaca-style short open valuation. | Broker performs buying-power checks for long/short orders, including open orders. | Different reject/accept outcomes. |
+| Tradable universe | Default mode trades whatever is in CSV/panel. Parity mode can enforce asset flags from `--asset-flags-csv`. | Asset must be active/tradable in Alpaca assets model. | Residual risk if flags CSV is stale or omitted. |
+| Short eligibility | Parity mode enforces opening-short checks (`shortable`, optional `easy_to_borrow`); close/reduce still allowed. | New shorts depend on short/margin eligibility and borrow status. | Lower than before; still depends on input flags freshness. |
+| Short sizing | Single-symbol max short shares + parity short BP checks; multi-asset also supports `--max-short-notional` and per-order notional cap. | Short opens consume buying power and are margin constrained. | Improved; still not full broker-level parity. |
+| Buying power checks | Parity mode applies short-open valuation rule `max(limit_price, ref_price * 1.03) * qty`; reservation semantics are modeled for accepted orders. | Broker performs buying-power checks for long/short orders, including open orders. | Improved reject parity; PDT/DTMC still out of scope. |
 | PDT/DTMC protections | Not simulated. | Enforced in paper, including PDT checks. | Strategies can pass backtest and fail in paper. |
 | Order lifecycle | Single-symbol backtest uses synthetic order book + random fill outcomes; multi-asset backtest fills immediately when signaled. | Orders follow broker lifecycle/statuses; non-marketable limits wait. | Fill timing/quantity mismatch. |
 | Fill assumptions | Single-symbol: 70% full, 20% partial, 10% cancel (engine random). Multi-asset: immediate fills at close/limit. | Paper fills against simulated NBBO assumptions and can partial-fill. | PnL path and turnover mismatch. |
@@ -57,53 +63,40 @@ This document maps the current behavior of this repository against Alpaca paper 
 
 ## Biggest repo-specific limitations
 
-1. Backtests do not enforce Alpaca asset flags (`tradable`, `shortable`, `easy_to_borrow`, `fractionable`).
-2. Backtests do not enforce Alpaca PDT/DTMC protections.
-3. Multi-asset backtest can open shorts without broker-side borrow and buying-power realism.
-4. Single-symbol backtest fill simulation is synthetic/random and not tied to real quote state.
-5. Multi-asset backtest fills are immediate and optimistic relative to real order lifecycle.
-6. Backtests do not model open-order reservation effects on buying power the same way as paper trading.
+1. Backtests do not enforce Alpaca PDT/DTMC protections.
+2. Single-symbol backtest fill simulation is synthetic/random and not tied to real quote state.
+3. Multi-asset backtest fills are immediate and optimistic relative to real order lifecycle.
+4. Asset-flag gating quality depends on the freshness/completeness of your `--asset-flags-csv`.
+5. Fractional stock behavior and extended-hours specifics are still not fully modeled.
 
-## Paper-Parity V1 scope (issue #2)
+## Implemented parity controls
 
-This repository's parity v1 scope is intentionally narrow and targets the highest-impact gaps first:
-- limitation **#1** (asset flags not enforced),
-- limitation **#3** (short opens without realistic constraints),
-- limitation **#6** (no open-order buying-power reservation),
-- plus Alpaca short-open valuation guidance from this doc: `max(limit_price, ask_price * 1.03) * quantity`.
+### CLI flags
 
-### In scope
-- Enforce tradable/short-related asset eligibility in backtests.
-- Improve short-open sizing realism with explicit buying-power checks.
-- Add open-order buying-power reservation semantics for accepted-but-not-filled orders.
+- `--paper-parity`
+- `--asset-flags-csv`
+- `--account-equity`
+- `--buying-power-mode {disabled,multiplier,tiered}`
+- `--buying-power-multiplier`
+- `--reserve-open-orders`
+- `--max-notional-per-order` (multi-asset)
+- `--max-short-notional` (multi-asset)
 
-### Out of scope for v1
-- Full PDT/DTMC simulation.
-- Full broker lifecycle/status parity for all order types and venues.
-- Full quote-driven fill realism replacement for current synthetic model.
+### Reject semantics used in parity mode
 
-### Implementation map (scope item -> touchpoints)
+- `reject_not_tradable`
+- `reject_not_shortable`
+- `reject_not_easy_to_borrow`
+- `reject_short_open_buying_power`
+- `reject_reserved_buying_power`
 
-| Scope item | Primary touchpoints | Why this is the right seam |
-|---|---|---|
-| Asset eligibility checks (`tradable`, `shortable`, `easy_to_borrow`) | `run_backtest.py`, `core/order_manager.py`, `core/backtester.py`, `core/multi_asset_backtester.py` | `run_backtest.py` can load/configure symbol flags; order acceptance is centralized in manager/backtest execution paths. |
-| Short-open sizing realism + 1.03 valuation rule | `core/order_manager.py`, `core/backtester.py`, `core/multi_asset_backtester.py` | Order validation is where open-vs-close intent and buying-power math should be enforced consistently. |
-| Open-order buying-power reservation | `core/order_manager.py`, `core/backtester.py`, `core/multi_asset_backtester.py` | Reservation state belongs with portfolio/risk state; submit/fill/cancel hooks live in the execution loops. |
-| Multi-asset cap wiring from CLI for parity operation | `run_backtest.py`, `core/multi_asset_backtester.py` | Existing engine supports notional caps, but CLI needs explicit parity controls to make behavior reproducible. |
+### Notes on behavior
 
-### Rollout order (MVP first)
-
-1. **PR 1 (MVP parity controls):**
-   - Add parity configuration surface and CLI wiring.
-   - Implement asset eligibility gating.
-   - Implement short-open valuation checks (`max(limit_price, ref_price * 1.03) * qty`).
-   - Add baseline tests for these checks.
-2. **PR 2 (reservation semantics):**
-   - Add open-order buying-power reservation/release lifecycle.
-   - Add regression tests for reservation behavior under concurrent orders.
-   - Update usage docs with reject semantics and parity-mode examples.
-
-This split keeps v1 small enough for one focused PR plus one follow-up hardening PR.
+- Opening-short valuation uses `max(limit_price, reference_price * 1.03) * qty`.
+- Close/reduce orders are allowed even when opening-short flags would reject new shorts.
+- Reservation lifecycle is tracked:
+  - single-symbol via order logger `reservation` events (`reserve` and `release`),
+  - multi-asset via `MultiAssetBacktester.reservation_events`.
 
 ## Parity-safe operating rules (recommended)
 

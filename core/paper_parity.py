@@ -144,3 +144,18 @@ def normalize_paper_parity_config(
             f"received {type(config).__name__}."
         )
     return config
+
+
+def short_open_unit_value(
+    *,
+    limit_price: float,
+    reference_price: float,
+    buffer: float,
+) -> float:
+    if limit_price <= 0:
+        raise ValueError("limit_price must be > 0.")
+    if reference_price <= 0:
+        raise ValueError("reference_price must be > 0.")
+    if buffer <= 0:
+        raise ValueError("buffer must be > 0.")
+    return max(float(limit_price), float(reference_price) * float(buffer))

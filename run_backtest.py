@@ -15,12 +15,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from core.asset_eligibility import AssetEligibilityFlags, parse_asset_flag_bool
 from core.backtester import Backtester, PerformanceAnalyzer, plot_equity
 from core.gateway import MarketDataGateway
 from core.matching_engine import MatchingEngine
 from core.multi_asset_backtester import MultiAssetBacktester
 from core.order_book import OrderBook
 from core.order_manager import OrderLoggingGateway, OrderManager
+from core.paper_parity import BuyingPowerConfig, PaperParityConfig
 from core.symbols import resolve_symbols
 from strategies import (
     CrossSectionalPaperReversalStrategy,
@@ -31,6 +33,46 @@ from strategies import (
 
 
 DATA_DIR = Path("data")
+
+
+def _parse_bool(value: object, *, default: bool = True) -> bool:
+    return parse_asset_flag_bool(value, default=default)
+
+
+def load_asset_flags_by_symbol(path: Path) -> dict[str, AssetEligibilityFlags]:
+    df = pd.read_csv(path)
+    if df.empty:
+        return {}
+
+    columns = {str(col).strip().lower(): str(col) for col in df.columns}
+    symbol_col = columns.get("symbol") or columns.get("ticker")
+    if symbol_col is None:
+        raise ValueError("Asset flags CSV must include a symbol or ticker column.")
+
+    tradable_col = columns.get("tradable")
+    shortable_col = columns.get("shortable")
+    etb_col = columns.get("easy_to_borrow")
+
+    out: dict[str, AssetEligibilityFlags] = {}
+    for _, row in df.iterrows():
+        symbol = str(row[symbol_col]).strip().upper()
+        if not symbol:
+            continue
+        out[symbol] = AssetEligibilityFlags(
+            tradable=_parse_bool(
+                row[tradable_col] if tradable_col is not None else True,
+                default=True,
+            ),
+            shortable=_parse_bool(
+                row[shortable_col] if shortable_col is not None else True,
+                default=True,
+            ),
+            easy_to_borrow=_parse_bool(
+                row[etb_col] if etb_col is not None else True,
+                default=True,
+            ),
+        )
+    return out
 
 
 def _apply_min_symbol_bars_filter(
@@ -288,7 +330,83 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot", action="store_true", help="Plot equity curve at the end."
     )
+    parser.add_argument(
+        "--paper-parity",
+        action="store_true",
+        help="Enable paper-parity controls for backtests.",
+    )
+    parser.add_argument(
+        "--asset-flags-csv",
+        type=str,
+        default="",
+        help=(
+            "Optional symbol flags CSV with symbol/ticker and tradable/shortable/"
+            "easy_to_borrow columns for parity eligibility gating."
+        ),
+    )
+    parser.add_argument(
+        "--account-equity",
+        type=float,
+        default=None,
+        help="Account equity for parity buying-power tier logic.",
+    )
+    parser.add_argument(
+        "--buying-power-mode",
+        choices=("disabled", "multiplier", "tiered"),
+        default="tiered",
+        help=(
+            "Buying power policy when --paper-parity is enabled: "
+            "disabled, multiplier, or tiered."
+        ),
+    )
+    parser.add_argument(
+        "--buying-power-multiplier",
+        type=float,
+        default=None,
+        help="Explicit buying-power multiplier used when --buying-power-mode=multiplier.",
+    )
+    parser.add_argument(
+        "--reserve-open-orders",
+        action="store_true",
+        help="Reserve buying power for open orders in parity mode.",
+    )
+    parser.add_argument(
+        "--max-notional-per-order",
+        type=float,
+        default=None,
+        help="Optional per-order notional cap for multi-asset backtests.",
+    )
+    parser.add_argument(
+        "--max-short-notional",
+        type=float,
+        default=None,
+        help="Optional total short notional cap for multi-asset backtests.",
+    )
     return parser.parse_args()
+
+
+def build_paper_parity_config(args: argparse.Namespace) -> PaperParityConfig:
+    if not args.paper_parity:
+        return PaperParityConfig.disabled()
+
+    buying_power = BuyingPowerConfig(
+        mode=str(args.buying_power_mode),
+        explicit_multiplier=args.buying_power_multiplier,
+    )
+    account_equity = args.account_equity
+    if account_equity is None and buying_power.mode == "tiered":
+        account_equity = buying_power.tier_day_trader_equity
+
+    return PaperParityConfig(
+        enabled=True,
+        require_tradable=True,
+        require_shortable=True,
+        require_easy_to_borrow=False,
+        allow_crypto_shorts=False,
+        buying_power=buying_power,
+        account_equity=account_equity,
+        reserve_open_orders=bool(args.reserve_open_orders),
+    )
 
 
 def build_strategy(strategy_cls, args: argparse.Namespace):
@@ -330,6 +448,13 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
 
 def main() -> None:
     args = parse_args()
+    asset_flags_by_symbol: dict[str, AssetEligibilityFlags] = {}
+    if args.asset_flags_csv:
+        asset_flags_path = Path(args.asset_flags_csv)
+        if not asset_flags_path.exists():
+            raise FileNotFoundError(f"Asset flags CSV not found: {asset_flags_path}")
+        asset_flags_by_symbol = load_asset_flags_by_symbol(asset_flags_path)
+    paper_parity = build_paper_parity_config(args)
 
     strategy_cls = get_strategy_class(args.strategy)
     strategy_probe = build_strategy(strategy_cls, args)
@@ -425,6 +550,10 @@ def main() -> None:
             panel_df=panel_df,
             strategy_factory=strategy_factory,
             initial_capital=args.capital,
+            max_notional_per_order=args.max_notional_per_order,
+            max_short_notional=args.max_short_notional,
+            paper_parity=paper_parity,
+            asset_flags_by_symbol=asset_flags_by_symbol,
         )
         interrupted = False
         try:
@@ -455,6 +584,16 @@ def main() -> None:
         print(f"PnL: {equity_df.iloc[-1]['equity'] - equity_df.iloc[0]['equity']:.2f}")
         print(f"Sharpe: {sharpe:.2f}")
         print(f"Max Drawdown: {float(drawdown):.4f}")
+        print(f"Paper parity enabled: {multi_bt.paper_parity.enabled}")
+        if multi_bt.paper_parity.enabled:
+            bp = multi_bt.paper_parity.buying_power
+            print(f"Parity buying-power mode: {bp.mode}")
+            print(f"Parity reserve-open-orders: {multi_bt.paper_parity.reserve_open_orders}")
+        print(
+            "Caps: "
+            f"max_notional_per_order={multi_bt.max_notional_per_order}, "
+            f"max_short_notional={multi_bt.max_short_notional}"
+        )
 
         if args.plot:
             plot_equity(equity_df)
@@ -484,6 +623,8 @@ def main() -> None:
         matching_engine=matching_engine,
         logger=logger,
         default_position_size=int(max(1, args.position_size)),
+        paper_parity=paper_parity,
+        asset_flags_by_symbol=asset_flags_by_symbol,
     )
 
     interrupted = False
