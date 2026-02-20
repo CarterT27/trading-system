@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -271,10 +272,22 @@ class Backtester:
         else:
             row_iter = stream_iter
 
+        required_lookback = int(getattr(self.strategy, "required_lookback", 0) or 0)
+        if required_lookback > 0:
+            strategy_window_rows: deque[Dict] = deque(maxlen=required_lookback)
+            strategy_window_index: deque[int] = deque(maxlen=required_lookback)
+        else:
+            strategy_window_rows = deque()
+            strategy_window_index = deque()
+        incremental_bar_index = 0
+
+        reset_incremental = getattr(self.strategy, "reset_incremental_state", None)
+        if callable(reset_incremental):
+            reset_incremental()
+
         try:
             for row in row_iter:
                 self.market_history.append(row)
-                market_df = pd.DataFrame(self.market_history)
                 if hasattr(self.strategy, "update_context"):
                     try:
                         self.strategy.update_context(position=self.order_manager.net_position)
@@ -282,16 +295,49 @@ class Backtester:
                         # Backwards compatibility if a strategy ignores context.
                         pass
 
-                strategy_df = market_df
-                required_lookback = int(getattr(self.strategy, "required_lookback", 0) or 0)
-                if required_lookback > 0 and len(market_df) > required_lookback:
-                    strategy_df = market_df.iloc[-required_lookback:]
+                latest_map: Dict[str, object] | None = None
+                latest_columns: set[str] = set()
+                run_incremental = getattr(self.strategy, "run_incremental", None)
+                if callable(run_incremental):
+                    try:
+                        incremental_out = run_incremental(
+                            row=row, bar_index=incremental_bar_index
+                        )
+                    except TypeError:
+                        try:
+                            incremental_out = run_incremental(row)
+                        except TypeError:
+                            incremental_out = run_incremental()
+                    if isinstance(incremental_out, pd.Series):
+                        latest_map = incremental_out.to_dict()
+                        latest_columns = set(incremental_out.index)
+                    elif isinstance(incremental_out, dict):
+                        latest_map = dict(incremental_out)
+                        latest_columns = set(latest_map.keys())
+                    elif incremental_out is not None:
+                        raise TypeError(
+                            "run_incremental must return dict/pd.Series/None."
+                        )
 
-                signals_df = self.strategy.run(strategy_df)
-                latest = signals_df.iloc[-1]
+                if latest_map is None:
+                    strategy_window_rows.append(dict(row))
+                    strategy_window_index.append(int(incremental_bar_index))
+                    strategy_df = pd.DataFrame(
+                        list(strategy_window_rows),
+                        index=list(strategy_window_index),
+                    )
+                    signals_df = self.strategy.run(strategy_df)
+                    latest = signals_df.iloc[-1]
+                    latest_map = latest.to_dict()
+                    latest_columns = set(signals_df.columns)
+
                 timestamp = pd.Timestamp(row["Datetime"])
-
-                price = float(latest["Close"])
+                close_value = latest_map.get("Close", row.get("Close"))
+                if close_value is None or pd.isna(close_value):
+                    incremental_bar_index += 1
+                    continue
+                latest_close = float(close_value)
+                price = latest_close
                 self._update_equity(price)
 
                 # ------------------------------------------------------------------
@@ -300,16 +346,16 @@ class Backtester:
                 # ------------------------------------------------------------------
                 submitted_any = False
 
-                if {"bid_price", "ask_price"} <= set(signals_df.columns):
+                if {"bid_price", "ask_price"} <= latest_columns:
                     orders_to_submit = []
 
-                    bid_active = bool(latest.get("bid_active", True))
-                    ask_active = bool(latest.get("ask_active", True))
-                    bid_price = latest.get("bid_price")
-                    ask_price = latest.get("ask_price")
+                    bid_active = bool(latest_map.get("bid_active", True))
+                    ask_active = bool(latest_map.get("ask_active", True))
+                    bid_price = latest_map.get("bid_price")
+                    ask_price = latest_map.get("ask_price")
 
                     if bid_active and pd.notna(bid_price):
-                        bid_qty_val = latest.get("bid_qty", self.default_position_size)
+                        bid_qty_val = latest_map.get("bid_qty", self.default_position_size)
                         bid_qty = (
                             float(bid_qty_val)
                             if pd.notna(bid_qty_val) and bid_qty_val > 0
@@ -318,7 +364,7 @@ class Backtester:
                         orders_to_submit.append((1, float(bid_price), bid_qty))
 
                     if ask_active and pd.notna(ask_price):
-                        ask_qty_val = latest.get("ask_qty", self.default_position_size)
+                        ask_qty_val = latest_map.get("ask_qty", self.default_position_size)
                         ask_qty = (
                             float(ask_qty_val)
                             if pd.notna(ask_qty_val) and ask_qty_val > 0
@@ -349,7 +395,7 @@ class Backtester:
                             continue
                         valid, reason = self.order_manager.validate(
                             order,
-                            reference_price=float(latest["Close"]),
+                            reference_price=latest_close,
                             paper_parity=self.paper_parity,
                         )
                         if not valid:
@@ -359,58 +405,68 @@ class Backtester:
                         submitted_any = True
 
                 if submitted_any:
+                    incremental_bar_index += 1
                     continue
 
                 # Fallback: classic single signal / limit_price pattern.
-                signal_value = latest.get("signal", 0)
+                signal_value = latest_map.get("signal", 0)
                 signal = int(signal_value) if pd.notna(signal_value) else 0
                 if signal == 0:
+                    incremental_bar_index += 1
                     continue
 
-                limit_price = latest.get("limit_price", latest["Close"])
-                price = float(limit_price) if pd.notna(limit_price) else float(latest["Close"])
-                qty_value = latest.get("target_qty", self.default_position_size)
+                limit_price = latest_map.get("limit_price", latest_close)
+                price = float(limit_price) if pd.notna(limit_price) else latest_close
+                qty_value = latest_map.get("target_qty", self.default_position_size)
                 qty_raw = (
                     float(qty_value)
                     if pd.notna(qty_value) and float(qty_value) > 0
                     else float(self.default_position_size)
                 )
                 if qty_raw <= 0:
+                    incremental_bar_index += 1
                     continue
 
                 if self.asset_class == "crypto":
                     qty = np.floor((qty_raw / max(price, 1e-12)) * 1_000_000.0) / 1_000_000.0
                     if qty <= 0:
+                        incremental_bar_index += 1
                         continue
                     if signal < 0:
                         net_pos = float(self.order_manager.net_position)
                         if net_pos <= 0:
                             self._log("rejected", {"order_id": "pending", "reason": "crypto shorting disabled"})
+                            incremental_bar_index += 1
                             continue
                         qty = min(qty, net_pos)
                         qty = np.floor(qty * 1_000_000.0) / 1_000_000.0
                         if qty <= 0:
+                            incremental_bar_index += 1
                             continue
                 else:
                     qty = float(int(qty_raw))
                     if qty <= 0:
+                        incremental_bar_index += 1
                         continue
 
                 order = self._create_order(signal, price, timestamp, qty)
                 eligible, reason = self._asset_eligibility(order)
                 if not eligible:
                     self._log("rejected", {"order_id": order.order_id, "reason": reason})
+                    incremental_bar_index += 1
                     continue
                 valid, reason = self.order_manager.validate(
                     order,
-                    reference_price=float(latest["Close"]),
+                    reference_price=latest_close,
                     paper_parity=self.paper_parity,
                 )
                 if not valid:
                     self._log("rejected", {"order_id": order.order_id, "reason": reason})
+                    incremental_bar_index += 1
                     continue
 
                 self._submit_order(order, timestamp, qty)
+                incremental_bar_index += 1
         finally:
             if progress is not None:
                 progress.close()
