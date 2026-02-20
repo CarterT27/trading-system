@@ -262,7 +262,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cs-hold",
         type=int,
-        default=30,
+        default=45,
         help="Hold window in minutes for cross-sectional reversal strategy.",
     )
     parser.add_argument(
@@ -292,13 +292,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cs-base-notional",
         type=float,
-        default=1000.0,
+        default=500.0,
         help="Base dollar notional per symbol before leverage in cross-sectional strategy.",
     )
     parser.add_argument(
         "--cs-target-annual-vol",
         type=float,
-        default=0.60,
+        default=0.30,
         help="Target annual vol for cross-sectional leverage sizing; 0 disables.",
     )
     parser.add_argument(
@@ -310,7 +310,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cs-max-leverage",
         type=float,
-        default=10.0,
+        default=2.0,
         help="Max leverage for cross-sectional strategy.",
     )
     parser.add_argument(
@@ -321,8 +321,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cs-no-flips",
+        dest="cs_no_flips",
         action="store_true",
-        help="Disable immediate side flips in cross-sectional strategy.",
+        help="Disable immediate side flips in cross-sectional strategy (default).",
+    )
+    parser.add_argument(
+        "--cs-allow-flips",
+        dest="cs_no_flips",
+        action="store_false",
+        help="Allow immediate side flips in cross-sectional strategy.",
     )
     parser.add_argument(
         "--capital", type=float, default=50_000, help="Initial capital."
@@ -367,21 +374,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reserve-open-orders",
+        dest="reserve_open_orders",
         action="store_true",
-        help="Reserve buying power for open orders in parity mode.",
+        help="Reserve buying power for open orders in parity mode (default).",
+    )
+    parser.add_argument(
+        "--no-reserve-open-orders",
+        dest="reserve_open_orders",
+        action="store_false",
+        help="Disable buying-power reservation for open orders in parity mode.",
     )
     parser.add_argument(
         "--max-notional-per-order",
         type=float,
-        default=None,
+        default=2_000.0,
         help="Optional per-order notional cap for multi-asset backtests.",
     )
     parser.add_argument(
         "--max-short-notional",
         type=float,
-        default=None,
+        default=20_000.0,
         help="Optional total short notional cap for multi-asset backtests.",
     )
+    parser.set_defaults(cs_no_flips=True, reserve_open_orders=True)
     return parser.parse_args()
 
 
@@ -448,6 +463,8 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
 
 def main() -> None:
     args = parse_args()
+    strategy_cls = get_strategy_class(args.strategy)
+
     asset_flags_by_symbol: dict[str, AssetEligibilityFlags] = {}
     if args.asset_flags_csv:
         asset_flags_path = Path(args.asset_flags_csv)
@@ -455,8 +472,6 @@ def main() -> None:
             raise FileNotFoundError(f"Asset flags CSV not found: {asset_flags_path}")
         asset_flags_by_symbol = load_asset_flags_by_symbol(asset_flags_path)
     paper_parity = build_paper_parity_config(args)
-
-    strategy_cls = get_strategy_class(args.strategy)
     strategy_probe = build_strategy(strategy_cls, args)
     is_cross_sectional = hasattr(strategy_probe, "run_panel")
 
