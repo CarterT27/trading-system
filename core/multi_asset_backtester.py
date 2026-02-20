@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from core.paper_parity import PaperParityConfig, normalize_paper_parity_config
 from strategies import Strategy
 
 
@@ -32,11 +33,13 @@ class MultiAssetBacktester:
         strategy_factory: Callable[[], Strategy],
         initial_capital: float = 50_000.0,
         max_notional_per_order: Optional[float] = None,
+        paper_parity: Optional[PaperParityConfig] = None,
     ):
         self.panel_df = self._prepare_panel(panel_df)
         self.strategy_factory = strategy_factory
         self.initial_capital = float(initial_capital)
         self.max_notional_per_order = max_notional_per_order
+        self.paper_parity = normalize_paper_parity_config(paper_parity)
 
         strategy_probe = strategy_factory()
         self.portfolio_strategy: Optional[Strategy] = None
