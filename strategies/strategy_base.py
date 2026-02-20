@@ -202,6 +202,86 @@ class CryptoTrendStrategy(Strategy):
         return df
 
 
+class CryptoRegimeTrendStrategy(Strategy):
+    """
+    Regime-aware crypto trend strategy.
+
+    Improves on basic EMA cross by requiring:
+    - fast EMA above slow EMA,
+    - slow EMA slope positive over a lookback window,
+    - realized volatility below a rolling quantile gate (causal threshold).
+    """
+
+    def __init__(
+        self,
+        short_window: int = 20,
+        long_window: int = 120,
+        slope_lookback: int = 240,
+        volatility_window: int = 1440,
+        volatility_quantile: float = 0.70,
+        position_size: float = 100.0,
+    ):
+        if short_window >= long_window:
+            raise ValueError("short_window must be strictly less than long_window.")
+        if slope_lookback < 1:
+            raise ValueError("slope_lookback must be at least 1.")
+        if volatility_window < 20:
+            raise ValueError("volatility_window must be at least 20.")
+        if not 0.0 < volatility_quantile <= 1.0:
+            raise ValueError("volatility_quantile must be in (0, 1].")
+        if position_size <= 0:
+            raise ValueError("position_size must be positive.")
+
+        self.short_window = short_window
+        self.long_window = long_window
+        self.slope_lookback = slope_lookback
+        self.volatility_window = volatility_window
+        self.volatility_quantile = volatility_quantile
+        self.position_size = position_size
+
+    @property
+    def required_lookback(self) -> int:
+        # Vol gate needs realized_vol history plus quantile-window history, then shift(1).
+        vol_min = max(20, self.volatility_window // 3)
+        quantile_min = max(50, self.volatility_window // 2)
+        vol_gate_ready = vol_min + quantile_min + 1
+        return max(self.long_window + 5, self.slope_lookback + 5, vol_gate_ready + 5)
+
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df["EMA_fast"] = df["Close"].ewm(span=self.short_window, adjust=False).mean()
+        df["EMA_slow"] = df["Close"].ewm(span=self.long_window, adjust=False).mean()
+        df["EMA_slow_slope"] = (
+            df["EMA_slow"].pct_change(self.slope_lookback).fillna(0.0)
+        )
+
+        returns = df["Close"].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        min_vol_samples = max(20, self.volatility_window // 3)
+        min_quantile_samples = max(50, self.volatility_window // 2)
+        df["realized_vol"] = returns.rolling(
+            self.volatility_window, min_periods=min_vol_samples
+        ).std()
+        vol_threshold = df["realized_vol"].rolling(
+            self.volatility_window, min_periods=min_quantile_samples
+        ).quantile(self.volatility_quantile)
+        # Shift threshold by one bar so the gate is strictly causal.
+        df["vol_gate_threshold"] = vol_threshold.shift(1)
+        return df
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df["signal"] = 0
+
+        long_regime = (df["EMA_fast"] > df["EMA_slow"]) & (df["EMA_slow_slope"] > 0.0)
+        vol_ok = df["realized_vol"] <= df["vol_gate_threshold"]
+        long_regime = long_regime & vol_ok.fillna(False)
+
+        flips = long_regime.astype(int).diff().fillna(0.0)
+        df.loc[flips > 0, "signal"] = 1
+        df.loc[flips < 0, "signal"] = -1
+        df["position"] = long_regime.astype(int)
+        df["target_qty"] = self.position_size
+        return df
+
+
 class CrossSectionalPaperReversalStrategy(CrossSectionalStrategy):
     """
     Cross-sectional intraday reversal portfolio strategy.
