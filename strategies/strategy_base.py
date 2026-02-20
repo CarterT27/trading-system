@@ -33,8 +33,15 @@ Example:
             return df
 """
 
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
+
+try:
+    from sklearn.ensemble import RandomForestClassifier
+except Exception:  # pragma: no cover - optional dependency guard
+    RandomForestClassifier = None  # type: ignore[assignment]
 
 
 class Strategy:
@@ -279,6 +286,477 @@ class CryptoRegimeTrendStrategy(Strategy):
         df.loc[flips < 0, "signal"] = -1
         df["position"] = long_regime.astype(int)
         df["target_qty"] = self.position_size
+        return df
+
+
+class CryptoCompetitionStrategy(Strategy):
+    """
+    Competition-focused crypto strategy that combines:
+    - regime trend filter,
+    - quality gates,
+    - causal (walk-forward) meta-model probability gate,
+    - dynamic entry sizing,
+    - exit-analysis rules.
+
+    Parameters are initialized to the strongest robust settings found in
+    notebooks/results/crypto_experiment_suite_20260220_optimized_v2.
+    """
+
+    META_FEATURE_COLS = (
+        "spread_z",
+        "EMA_slow_slope",
+        "vol_ratio",
+        "ret1",
+        "ret5",
+        "ret30",
+        "trend_tstat",
+    )
+
+    def __init__(
+        self,
+        short_window: int = 20,
+        long_window: int = 120,
+        slope_lookback: int = 120,
+        volatility_window: int = 1440,
+        volatility_quantile: float = 0.70,
+        spread_z_threshold: float = 0.0,
+        trend_tstat_threshold: float = 0.0,
+        vol_ratio_max: float = 1.2,
+        require_ret5_positive: bool = True,
+        require_ret30_positive: bool = False,
+        meta_n_estimators: int = 350,
+        meta_max_depth: int = 4,
+        meta_min_samples_leaf: int = 15,
+        meta_max_features: str = "sqrt",
+        meta_prob_threshold: float = 0.50,
+        meta_min_train_samples: int = 300,
+        meta_refit_interval: int = 120,
+        meta_train_window: int | None = 3000,
+        sizing_scale: float = 1.5,
+        sizing_offset: float = 0.3,
+        sizing_vol_exponent: float = 0.75,
+        sizing_smooth_span: int = 1,
+        sizing_min_size: float = 0.05,
+        exit_mode: str = "combo",
+        exit_time_bars: int | None = 180,
+        exit_trail_stop: float | None = 0.008,
+        exit_profit_take: float | None = None,
+        exit_min_hold_bars: int = 0,
+        position_size: float = 100.0,
+    ):
+        if short_window >= long_window:
+            raise ValueError("short_window must be strictly less than long_window.")
+        if slope_lookback < 1:
+            raise ValueError("slope_lookback must be at least 1.")
+        if volatility_window < 20:
+            raise ValueError("volatility_window must be at least 20.")
+        if not 0.0 < volatility_quantile <= 1.0:
+            raise ValueError("volatility_quantile must be in (0, 1].")
+        if meta_prob_threshold <= 0.0 or meta_prob_threshold >= 1.0:
+            raise ValueError("meta_prob_threshold must be in (0, 1).")
+        if meta_n_estimators < 10:
+            raise ValueError("meta_n_estimators must be at least 10.")
+        if meta_max_depth < 2:
+            raise ValueError("meta_max_depth must be at least 2.")
+        if meta_min_samples_leaf < 1:
+            raise ValueError("meta_min_samples_leaf must be at least 1.")
+        if meta_min_train_samples < 100:
+            raise ValueError("meta_min_train_samples must be at least 100.")
+        if meta_refit_interval < 1:
+            raise ValueError("meta_refit_interval must be at least 1.")
+        if meta_train_window is not None and meta_train_window < meta_min_train_samples:
+            raise ValueError(
+                "meta_train_window must be >= meta_min_train_samples when provided."
+            )
+        if sizing_scale <= 0.0:
+            raise ValueError("sizing_scale must be positive.")
+        if sizing_vol_exponent <= 0.0:
+            raise ValueError("sizing_vol_exponent must be positive.")
+        if sizing_smooth_span < 1:
+            raise ValueError("sizing_smooth_span must be at least 1.")
+        if sizing_min_size < 0.0:
+            raise ValueError("sizing_min_size must be non-negative.")
+        if exit_mode not in {"baseline", "time", "trail", "combo"}:
+            raise ValueError("exit_mode must be one of baseline/time/trail/combo.")
+        if exit_min_hold_bars < 0:
+            raise ValueError("exit_min_hold_bars must be non-negative.")
+        if position_size <= 0:
+            raise ValueError("position_size must be positive.")
+        if RandomForestClassifier is None:
+            raise ImportError(
+                "CryptoCompetitionStrategy requires scikit-learn. "
+                "Install dependencies from requirements.txt."
+            )
+
+        self.short_window = short_window
+        self.long_window = long_window
+        self.slope_lookback = slope_lookback
+        self.volatility_window = volatility_window
+        self.volatility_quantile = volatility_quantile
+
+        self.spread_z_threshold = spread_z_threshold
+        self.trend_tstat_threshold = trend_tstat_threshold
+        self.vol_ratio_max = vol_ratio_max
+        self.require_ret5_positive = require_ret5_positive
+        self.require_ret30_positive = require_ret30_positive
+
+        self.meta_n_estimators = meta_n_estimators
+        self.meta_max_depth = meta_max_depth
+        self.meta_min_samples_leaf = meta_min_samples_leaf
+        self.meta_max_features = meta_max_features
+        self.meta_prob_threshold = meta_prob_threshold
+        self.meta_min_train_samples = meta_min_train_samples
+        self.meta_refit_interval = meta_refit_interval
+        self.meta_train_window = meta_train_window
+
+        self.sizing_scale = sizing_scale
+        self.sizing_offset = sizing_offset
+        self.sizing_vol_exponent = sizing_vol_exponent
+        self.sizing_smooth_span = sizing_smooth_span
+        self.sizing_min_size = sizing_min_size
+
+        self.exit_mode = exit_mode
+        self.exit_time_bars = exit_time_bars
+        self.exit_trail_stop = exit_trail_stop
+        self.exit_profit_take = exit_profit_take
+        self.exit_min_hold_bars = exit_min_hold_bars
+        self.position_size = position_size
+
+        self._reset_meta_cache()
+
+    def _reset_meta_cache(self) -> None:
+        self._meta_cache_index: pd.Index | None = None
+        self._meta_cache_probs: np.ndarray = np.array([], dtype=float)
+        self._meta_cache_model: RandomForestClassifier | None = None
+        self._meta_cache_const_prob: float = 0.5
+        self._meta_cache_last_refit_bar: int = -10**9
+
+    @property
+    def required_lookback(self) -> int:
+        vol_min = max(20, self.volatility_window // 3)
+        quantile_min = max(50, self.volatility_window // 2)
+        vol_gate_ready = vol_min + quantile_min + 1
+        exit_ready = (
+            int(self.exit_time_bars) + 5
+            if self.exit_time_bars is not None and self.exit_time_bars > 0
+            else 5
+        )
+        return max(
+            self.long_window + 5,
+            self.slope_lookback + 5,
+            vol_gate_ready + 5,
+            730,  # spread_z rolling stats warmup
+            self.meta_min_train_samples + self.meta_refit_interval + 5,
+            exit_ready,
+        )
+
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df["ret1"] = (
+            df["Close"].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
+        df["ret5"] = (
+            df["Close"].pct_change(5).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
+        df["ret30"] = (
+            df["Close"].pct_change(30).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
+        # Keep NaN at the end so unknown future labels are excluded from training.
+        df["fwd_ret"] = df["Close"].pct_change().shift(-1).replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+        df["EMA_fast"] = df["Close"].ewm(span=self.short_window, adjust=False).mean()
+        df["EMA_slow"] = df["Close"].ewm(span=self.long_window, adjust=False).mean()
+        df["EMA_slow_slope"] = (
+            df["EMA_slow"].pct_change(self.slope_lookback).fillna(0.0)
+        )
+
+        min_vol_samples = max(20, self.volatility_window // 3)
+        min_q_samples = max(50, self.volatility_window // 2)
+        df["realized_vol"] = df["ret1"].rolling(
+            self.volatility_window, min_periods=min_vol_samples
+        ).std()
+        vol_threshold = (
+            df["realized_vol"]
+            .rolling(self.volatility_window, min_periods=min_q_samples)
+            .quantile(self.volatility_quantile)
+        )
+        df["vol_gate_threshold"] = vol_threshold.shift(1)
+        df["vol_med_threshold"] = (
+            df["realized_vol"]
+            .rolling(self.volatility_window, min_periods=min_q_samples)
+            .quantile(0.5)
+            .shift(1)
+        )
+        df["vol_ok"] = (df["realized_vol"] <= df["vol_gate_threshold"]).fillna(False)
+
+        spread = ((df["EMA_fast"] - df["EMA_slow"]) / df["EMA_slow"]).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        spread_mean = spread.rolling(720, min_periods=100).mean()
+        spread_std = spread.rolling(720, min_periods=100).std()
+        df["spread_z"] = ((spread - spread_mean) / (spread_std + 1e-12)).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        df["trend_tstat"] = (
+            (df["EMA_fast"] - df["EMA_slow"]).abs()
+            / (df["Close"] * df["realized_vol"] + 1e-12)
+        ).replace([np.inf, -np.inf], np.nan)
+        df["vol_ratio"] = (df["realized_vol"] / (df["vol_gate_threshold"] + 1e-12)).replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+        df["trend_pre"] = (df["EMA_fast"] > df["EMA_slow"]).fillna(False)
+        df["base_long"] = (
+            df["trend_pre"] & (df["EMA_slow_slope"] > 0.0) & df["vol_ok"]
+        ).astype(float)
+        return df
+
+    def _fit_meta_model(
+        self,
+        train_df: pd.DataFrame,
+    ) -> tuple[RandomForestClassifier | None, float]:
+        if train_df.empty:
+            return None, 0.5
+
+        y = (train_df["fwd_ret"].values > 0.0).astype(int)
+        positive_rate = float(y.mean()) if len(y) else 0.5
+        if len(train_df) < self.meta_min_train_samples:
+            return None, positive_rate
+        if positive_rate <= 0.01 or positive_rate >= 0.99:
+            return None, positive_rate
+
+        X = (
+            train_df[list(self.META_FEATURE_COLS)]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .values.astype(float)
+        )
+        X = np.clip(X, -50.0, 50.0)
+        model = RandomForestClassifier(
+            n_estimators=int(self.meta_n_estimators),
+            max_depth=int(self.meta_max_depth),
+            min_samples_leaf=int(self.meta_min_samples_leaf),
+            max_features=self.meta_max_features,
+            random_state=42,
+        )
+        try:
+            model.fit(X, y)
+        except Exception:
+            return None, positive_rate
+        return model, positive_rate
+
+    def _compute_causal_meta_prob(self, df: pd.DataFrame) -> pd.Series:
+        n = len(df)
+        probs = pd.Series(0.5, index=df.index, dtype=float)
+        if n == 0:
+            self._reset_meta_cache()
+            return probs
+
+        # Fast path: identical index means we can return cached probabilities.
+        if self._meta_cache_index is not None and df.index.equals(self._meta_cache_index):
+            if len(self._meta_cache_probs) == n:
+                return pd.Series(self._meta_cache_probs, index=df.index, dtype=float)
+
+        feature_frame = df[list(self.META_FEATURE_COLS)].replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+        incremental = (
+            self._meta_cache_index is not None
+            and len(self._meta_cache_probs) + 1 == n
+            and df.index[:-1].equals(self._meta_cache_index)
+        )
+        sliding_incremental = (
+            self._meta_cache_index is not None
+            and len(self._meta_cache_probs) == n
+            and n > 1
+            and df.index[:-1].equals(self._meta_cache_index[1:])
+        )
+
+        if incremental:
+            probs_np = np.concatenate([self._meta_cache_probs, np.array([0.5])])
+            start_i = n - 1
+            model = self._meta_cache_model
+            const_prob = float(self._meta_cache_const_prob)
+            last_refit = int(self._meta_cache_last_refit_bar)
+        elif sliding_incremental:
+            probs_np = np.concatenate([self._meta_cache_probs[1:], np.array([0.5])])
+            start_i = n - 1
+            model = self._meta_cache_model
+            const_prob = float(self._meta_cache_const_prob)
+            # Window shifted by one bar, so rebase refit pointer by -1.
+            last_refit = int(self._meta_cache_last_refit_bar) - 1
+        else:
+            probs_np = np.full(n, 0.5, dtype=float)
+            start_i = 0
+            model = None
+            const_prob = 0.5
+            last_refit = -10**9
+
+        for i in range(start_i, n):
+            if model is None or (i - last_refit) >= self.meta_refit_interval:
+                lo = 0
+                if self.meta_train_window is not None:
+                    lo = max(0, i - int(self.meta_train_window))
+                train_block = df.iloc[lo:i]
+                if len(train_block):
+                    valid_train = (
+                        train_block["trend_pre"].astype(bool)
+                        & train_block[list(self.META_FEATURE_COLS)].replace(
+                            [np.inf, -np.inf], np.nan
+                        ).notna().all(axis=1)
+                        & train_block["fwd_ret"].notna()
+                    )
+                    train_df = train_block.loc[valid_train]
+                else:
+                    train_df = train_block
+                model, const_prob = self._fit_meta_model(train_df)
+                last_refit = i
+
+            row = (
+                feature_frame.iloc[i]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .values.astype(float)
+            )
+            row = np.clip(row, -50.0, 50.0).reshape(1, -1)
+            if model is None:
+                p = float(const_prob)
+            else:
+                p = float(model.predict_proba(row)[0, 1])
+            probs_np[i] = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+
+        self._meta_cache_index = df.index.copy()
+        self._meta_cache_probs = probs_np.copy()
+        self._meta_cache_model = model
+        self._meta_cache_const_prob = float(const_prob)
+        self._meta_cache_last_refit_bar = int(last_refit)
+        return pd.Series(probs_np, index=df.index, dtype=float)
+
+    def _apply_quality_filter(self, df: pd.DataFrame) -> pd.Series:
+        q = df["base_long"] > 0.0
+        q = q & (df["spread_z"] > self.spread_z_threshold).fillna(False)
+        q = q & (df["trend_tstat"] > self.trend_tstat_threshold).fillna(False)
+        q = q & (df["vol_ratio"] <= self.vol_ratio_max).fillna(False)
+        if self.require_ret30_positive:
+            q = q & (df["ret30"] > 0.0).fillna(False)
+        if self.require_ret5_positive:
+            q = q & (df["ret5"] > 0.0).fillna(False)
+        return q.astype(float)
+
+    def _dynamic_size(self, df: pd.DataFrame) -> pd.Series:
+        strength = (df["spread_z"] - self.sizing_offset).clip(lower=0.0).fillna(0.0)
+        vol_ratio = df["vol_ratio"].clip(lower=0.5, upper=5.0).fillna(1.0)
+        vol_adj = 1.0 / (vol_ratio ** self.sizing_vol_exponent)
+        size = (self.sizing_scale * strength * vol_adj).clip(lower=0.0, upper=1.0)
+        if self.sizing_smooth_span > 1:
+            size = size.ewm(span=self.sizing_smooth_span, adjust=False).mean()
+        size = size.where(size >= self.sizing_min_size, 0.0)
+        return size.astype(float)
+
+    def _position_with_exit_and_size(
+        self,
+        entry_gate: pd.Series,
+        size_series: pd.Series,
+        close: pd.Series,
+    ) -> pd.Series:
+        sig = entry_gate.fillna(0.0).astype(float).values
+        size = size_series.fillna(0.0).clip(lower=0.0, upper=1.0).astype(float).values
+        px = close.astype(float).values
+
+        n = len(entry_gate)
+        out = np.zeros(n, dtype=float)
+        in_pos = False
+        held_size = 0.0
+        hold = 0
+        peak = 0.0
+        entry_price = 0.0
+        lock_until_reset = False
+
+        for i in range(n):
+            signal_on = sig[i] > 0.5
+            price = float(px[i])
+
+            if not signal_on:
+                lock_until_reset = False
+
+            if not in_pos:
+                if signal_on and not lock_until_reset:
+                    in_pos = True
+                    held_size = float(size[i])
+                    hold = 0
+                    peak = price
+                    entry_price = price
+            else:
+                hold += 1
+                if price > peak:
+                    peak = price
+                exit_now = False
+                forced_exit = False
+                if not signal_on:
+                    exit_now = True
+                else:
+                    if hold >= int(max(0, self.exit_min_hold_bars)):
+                        if (
+                            self.exit_mode in {"time", "combo"}
+                            and self.exit_time_bars is not None
+                            and hold >= int(self.exit_time_bars)
+                        ):
+                            exit_now = True
+                            forced_exit = True
+                        if (
+                            self.exit_mode in {"trail", "combo"}
+                            and self.exit_trail_stop is not None
+                            and peak > 0
+                        ):
+                            drawdown = price / peak - 1.0
+                            if drawdown <= -float(self.exit_trail_stop):
+                                exit_now = True
+                                forced_exit = True
+                        if self.exit_profit_take is not None and entry_price > 0:
+                            pnl = price / entry_price - 1.0
+                            if pnl >= float(self.exit_profit_take):
+                                exit_now = True
+                                forced_exit = True
+                if exit_now:
+                    in_pos = False
+                    held_size = 0.0
+                    hold = 0
+                    peak = 0.0
+                    entry_price = 0.0
+                    if forced_exit:
+                        lock_until_reset = True
+            out[i] = held_size if in_pos else 0.0
+
+        return pd.Series(out, index=entry_gate.index, dtype=float)
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df["quality_long"] = self._apply_quality_filter(df)
+        df["meta_prob"] = self._compute_causal_meta_prob(df)
+        df["meta_long"] = (df["meta_prob"] > self.meta_prob_threshold).astype(float)
+
+        entry_gate = (
+            (df["quality_long"] > 0.0) & (df["meta_long"] > 0.0)
+        ).astype(float)
+        size = self._dynamic_size(df)
+        position_frac = self._position_with_exit_and_size(
+            entry_gate=entry_gate,
+            size_series=size,
+            close=df["Close"],
+        )
+
+        desired_notional = (position_frac * self.position_size).fillna(0.0)
+        delta = desired_notional.diff().fillna(desired_notional).fillna(0.0)
+        eps = 1e-9
+
+        df["signal"] = 0
+        df.loc[delta > eps, "signal"] = 1
+        df.loc[delta < -eps, "signal"] = -1
+        df["target_qty"] = delta.abs().astype(float)
+        # Keep position neutral in output so live runner relies on explicit signals only.
+        df["position"] = 0
+        df["desired_position_frac"] = position_frac.astype(float)
         return df
 
 

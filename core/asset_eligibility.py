@@ -73,19 +73,19 @@ def normalize_asset_flags_by_symbol(
     return out
 
 
-def opening_short_qty(*, side: str, qty: int, current_position: int) -> int:
+def opening_short_qty(*, side: str, qty: float, current_position: float) -> float:
     if side != "sell" or qty <= 0:
-        return 0
-    long_to_close = max(0, int(current_position))
-    return max(0, int(qty) - long_to_close)
+        return 0.0
+    long_to_close = max(0.0, float(current_position))
+    return max(0.0, float(qty) - long_to_close)
 
 
 def evaluate_asset_eligibility(
     *,
     symbol: str,
     side: str,
-    qty: int,
-    current_position: int,
+    qty: float,
+    current_position: float,
     parity: PaperParityConfig,
     asset_flags_by_symbol: Optional[Mapping[str, AssetEligibilityFlags]] = None,
 ) -> tuple[bool, str]:
@@ -100,8 +100,8 @@ def evaluate_asset_eligibility(
 
     short_open_qty = opening_short_qty(
         side=side,
-        qty=int(qty),
-        current_position=int(current_position),
+        qty=float(qty),
+        current_position=float(current_position),
     )
     if short_open_qty <= 0:
         return True, ELIGIBILITY_OK

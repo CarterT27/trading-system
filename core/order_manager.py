@@ -14,27 +14,27 @@ class OrderManager:
     def __init__(
         self,
         capital: float = 100_000.0,
-        max_long_position: int = 500,
-        max_short_position: int = 500,
+        max_long_position: float = 500.0,
+        max_short_position: float = 500.0,
         max_orders_per_min: int = 30,
     ):
         self.initial_capital = float(capital)
         self.cash = self.initial_capital
-        self.max_long_position = max_long_position
-        self.max_short_position = max_short_position
+        self.max_long_position = float(max_long_position)
+        self.max_short_position = float(max_short_position)
         self.max_orders_per_min = max_orders_per_min
 
         self.order_timestamps: list[float] = []
-        self.long_position = 0
-        self.short_position = 0
+        self.long_position = 0.0
+        self.short_position = 0.0
         self.reserved_buying_power = 0.0
         self._reserved_by_order_id: dict[str, float] = {}
 
     # ------------------------------------------------------------------ utils
 
     @property
-    def net_position(self) -> int:
-        return self.long_position - self.short_position
+    def net_position(self) -> float:
+        return float(self.long_position - self.short_position)
 
     def portfolio_value(self, price: float) -> float:
         return self.cash + self.long_position * price - self.short_position * price
@@ -44,7 +44,7 @@ class OrderManager:
     def _check_capital(self, order, *, reserved_buffer: float = 0.0) -> bool:
         if order.side == "buy":
             available_cash = max(0.0, float(self.cash) - max(0.0, float(reserved_buffer)))
-            return float(order.price) * int(order.qty) <= available_cash
+            return float(order.price) * float(order.qty) <= available_cash
         return True
 
     def _project_positions(self, order):
@@ -78,10 +78,10 @@ class OrderManager:
         self.order_timestamps = [t for t in self.order_timestamps if now - t < 60]
         return len(self.order_timestamps) < self.max_orders_per_min
 
-    def _opening_short_qty(self, order) -> int:
+    def _opening_short_qty(self, order) -> float:
         if order.side != "sell":
-            return 0
-        return max(0, int(order.qty) - max(0, int(self.long_position)))
+            return 0.0
+        return max(0.0, float(order.qty) - max(0.0, float(self.long_position)))
 
     def _check_short_open_buying_power(
         self,
@@ -124,10 +124,10 @@ class OrderManager:
 
         return True, "Order approved"
 
-    def _opening_long_qty(self, order) -> int:
+    def _opening_long_qty(self, order) -> float:
         if order.side != "buy":
-            return 0
-        return max(0, int(order.qty) - max(0, int(self.short_position)))
+            return 0.0
+        return max(0.0, float(order.qty) - max(0.0, float(self.short_position)))
 
     def _reservation_cost(
         self,
@@ -176,7 +176,7 @@ class OrderManager:
         self,
         order,
         *,
-        filled_qty: int,
+        filled_qty: float,
         status: str,
         reference_price: Optional[float],
         paper_parity: Optional[PaperParityConfig],
@@ -230,14 +230,14 @@ class OrderManager:
         self.order_timestamps.append(time.time())
         return True, "Order approved"
 
-    def record_execution(self, order, filled_qty: int, price: float) -> None:
+    def record_execution(self, order, filled_qty: float, price: float) -> None:
         """
         Update capital and open positions after an execution report.
         """
         if filled_qty <= 0:
             return
 
-        qty_remaining = filled_qty
+        qty_remaining = float(filled_qty)
         if order.side == "buy":
             if self.short_position > 0:
                 cover = min(qty_remaining, self.short_position)

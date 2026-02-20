@@ -26,6 +26,7 @@ from core.paper_parity import BuyingPowerConfig, PaperParityConfig
 from core.symbols import resolve_symbols
 from strategies import (
     CrossSectionalPaperReversalStrategy,
+    CryptoCompetitionStrategy,
     MovingAverageStrategy,
     TemplateStrategy,
     get_strategy_class,
@@ -180,6 +181,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to a long-form multi-symbol panel CSV with Datetime,symbol,OHLCV.",
     )
     parser.add_argument(
+        "--asset-class",
+        choices=("auto", "stock", "crypto"),
+        default="auto",
+        help="Asset class for single-asset backtests (default: auto).",
+    )
+    parser.add_argument(
         "--symbol",
         type=str,
         default="AAPL",
@@ -332,15 +339,40 @@ def parse_args() -> argparse.Namespace:
         help="Allow immediate side flips in cross-sectional strategy.",
     )
     parser.add_argument(
-        "--capital", type=float, default=50_000, help="Initial capital."
+        "--capital", type=float, default=100_000, help="Initial capital."
     )
     parser.add_argument(
         "--plot", action="store_true", help="Plot equity curve at the end."
     )
     parser.add_argument(
-        "--paper-parity",
+        "--verbose-trades",
+        dest="verbose_trades",
         action="store_true",
-        help="Enable paper-parity controls for backtests.",
+        help="Print each simulated fill line in single-asset mode (default).",
+    )
+    parser.add_argument(
+        "--no-verbose-trades",
+        dest="verbose_trades",
+        action="store_false",
+        help="Disable per-fill trade prints in single-asset mode.",
+    )
+    parser.add_argument(
+        "--fill-seed",
+        type=int,
+        default=42,
+        help="Deterministic random seed for single-asset fill simulation (default: 42).",
+    )
+    parser.add_argument(
+        "--paper-parity",
+        dest="paper_parity",
+        action="store_true",
+        help="Enable paper-parity controls for backtests (default).",
+    )
+    parser.add_argument(
+        "--no-paper-parity",
+        dest="paper_parity",
+        action="store_false",
+        help="Disable paper-parity controls for backtests.",
     )
     parser.add_argument(
         "--asset-flags-csv",
@@ -396,7 +428,12 @@ def parse_args() -> argparse.Namespace:
         default=20_000.0,
         help="Optional total short notional cap for multi-asset backtests.",
     )
-    parser.set_defaults(cs_no_flips=True, reserve_open_orders=True)
+    parser.set_defaults(
+        cs_no_flips=True,
+        reserve_open_orders=True,
+        paper_parity=True,
+        verbose_trades=True,
+    )
     return parser.parse_args()
 
 
@@ -438,6 +475,10 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
             buy_threshold=args.buy_threshold,
             sell_threshold=args.sell_threshold,
         )
+    if strategy_cls is CryptoCompetitionStrategy:
+        return CryptoCompetitionStrategy(
+            position_size=args.position_size,
+        )
     if strategy_cls is CrossSectionalPaperReversalStrategy:
         return CrossSectionalPaperReversalStrategy(
             lookback_minutes=args.cs_lookback,
@@ -459,6 +500,23 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
         raise SystemExit(
             f"{strategy_cls.__name__} must support a no-arg constructor or use --strategy template."
         ) from exc
+
+
+def resolve_single_asset_class(
+    args: argparse.Namespace, strategy, csv_path: Path
+) -> str:
+    requested = str(getattr(args, "asset_class", "auto")).strip().lower()
+    if requested in {"stock", "crypto"}:
+        return requested
+
+    strategy_name = strategy.__class__.__name__.lower()
+    if "crypto" in strategy_name:
+        return "crypto"
+
+    stem = csv_path.stem.upper()
+    if "-USD" in stem or "_USD" in stem or "BTC" in stem or "ETH" in stem or "SOL" in stem:
+        return "crypto"
+    return "stock"
 
 
 def main() -> None:
@@ -622,12 +680,13 @@ def main() -> None:
         print(f"Sample data generated at {csv_path}.")
 
     strategy = strategy_probe
+    single_asset_class = resolve_single_asset_class(args, strategy, csv_path)
     gateway = MarketDataGateway(csv_path)
     order_book = OrderBook()
     order_manager = OrderManager(
         capital=args.capital, max_long_position=1_000, max_short_position=1_000
     )
-    matching_engine = MatchingEngine()
+    matching_engine = MatchingEngine(seed=args.fill_seed)
     logger = OrderLoggingGateway()
 
     backtester = Backtester(
@@ -638,6 +697,9 @@ def main() -> None:
         matching_engine=matching_engine,
         logger=logger,
         default_position_size=int(max(1, args.position_size)),
+        verbose=bool(args.verbose_trades),
+        show_progress=True,
+        asset_class=single_asset_class,
         paper_parity=paper_parity,
         asset_flags_by_symbol=asset_flags_by_symbol,
     )
