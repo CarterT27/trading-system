@@ -1,4 +1,5 @@
 import heapq
+import math
 import time
 
 class Order:
@@ -26,6 +27,7 @@ class OrderBook:
     """
     Manages bid/ask orders and performs price-time priority matching.
     """
+    QTY_EPS = 1e-12
 
     def __init__(self):
         self.bids = []  # max heap
@@ -86,12 +88,11 @@ class OrderBook:
             best_bid.qty -= qty
             best_ask.qty -= qty
 
-            if best_bid.qty == 0:
+            if math.isclose(best_bid.qty, 0.0, abs_tol=self.QTY_EPS) or best_bid.qty < self.QTY_EPS:
                 heapq.heappop(self.bids)
                 self.order_map.pop(best_bid.order_id, None)
 
-            if best_ask.qty == 0:
+            if math.isclose(best_ask.qty, 0.0, abs_tol=self.QTY_EPS) or best_ask.qty < self.QTY_EPS:
                 heapq.heappop(self.asks)
                 self.order_map.pop(best_ask.order_id, None)
-
         return trades

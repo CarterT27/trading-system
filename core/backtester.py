@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 from core.asset_eligibility import (
     evaluate_asset_eligibility,
@@ -27,7 +28,7 @@ class TradeRecord:
     timestamp: pd.Timestamp
     side: str
     price: float
-    qty: int
+    qty: float
     status: str
     pnl: float
 
@@ -48,6 +49,8 @@ class Backtester:
         logger: Optional[OrderLoggingGateway] = None,
         default_position_size: int = 10,
         verbose: bool = True,
+        show_progress: bool = False,
+        asset_class: str = "stock",
         paper_parity: Optional[PaperParityConfig] = None,
         asset_flags_by_symbol: Optional[Dict[str, object]] = None,
     ):
@@ -59,18 +62,23 @@ class Backtester:
         self.logger = logger
         self.default_position_size = default_position_size
         self.verbose = verbose
+        self.show_progress = bool(show_progress)
+        asset_class = str(asset_class).strip().lower()
+        if asset_class not in {"stock", "crypto"}:
+            raise ValueError("asset_class must be 'stock' or 'crypto'.")
+        self.asset_class = asset_class
         self.paper_parity = normalize_paper_parity_config(paper_parity)
         self.asset_flags_by_symbol = normalize_asset_flags_by_symbol(asset_flags_by_symbol)
 
         self.market_history: List[Dict] = []
         self.equity_curve: List[float] = []
         self.cash_history: List[float] = []
-        self.position_history: List[int] = []
+        self.position_history: List[float] = []
         self.trades: List[TradeRecord] = []
 
         self._order_counter = 0
-        self._long_inventory = 0
-        self._short_inventory = 0
+        self._long_inventory = 0.0
+        self._short_inventory = 0.0
         self._long_avg_price = 0.0
         self._short_avg_price = 0.0
 
@@ -85,7 +93,9 @@ class Backtester:
         self._order_counter += 1
         return order_id
 
-    def _create_order(self, signal: int, price: float, timestamp: pd.Timestamp, qty: int) -> Order:
+    def _create_order(
+        self, signal: int, price: float, timestamp: pd.Timestamp, qty: float
+    ) -> Order:
         return Order(
             order_id=self._next_order_id(),
             side="buy" if signal > 0 else "sell",
@@ -94,18 +104,23 @@ class Backtester:
             timestamp=timestamp.timestamp(),
         )
 
+    def _format_qty(self, qty: float) -> str:
+        if self.asset_class == "crypto":
+            return f"{float(qty):.6f}".rstrip("0").rstrip(".")
+        return str(int(round(float(qty))))
+
     def _update_equity(self, price: float) -> None:
         equity = self.order_manager.portfolio_value(price)
         self.equity_curve.append(equity)
         self.cash_history.append(self.order_manager.cash)
         self.position_history.append(self.order_manager.net_position)
 
-    def _apply_fill(self, order: Order, filled_qty: int, price: float) -> float:
+    def _apply_fill(self, order: Order, filled_qty: float, price: float) -> float:
         """
         Update inventory tracking for realized PnL statistics.
         """
         realized = 0.0
-        qty_remaining = filled_qty
+        qty_remaining = float(filled_qty)
 
         if order.side == "buy":
             if self._short_inventory > 0:
@@ -140,7 +155,7 @@ class Backtester:
     def _print_trade(
         self,
         order: Order,
-        filled_qty: int,
+        filled_qty: float,
         price: float,
         timestamp: pd.Timestamp,
         status: str,
@@ -150,12 +165,13 @@ class Backtester:
         symbol = getattr(self.data_gateway, "symbol", "ASSET")
         net_pnl = self.order_manager.portfolio_value(price) - self.order_manager.initial_capital
         side = order.side.upper()
+        qty_text = self._format_qty(filled_qty)
         print(
-            f"{timestamp:%Y-%m-%d %H:%M:%S} | {side} {filled_qty} {symbol} @ {price:.2f} "
+            f"{timestamp:%Y-%m-%d %H:%M:%S} | {side} {qty_text} {symbol} @ {price:.2f} "
             f"| status={status} | net_pnl={net_pnl:+.2f}"
         )
 
-    def _submit_order(self, order: Order, timestamp: pd.Timestamp, quantity: int) -> None:
+    def _submit_order(self, order: Order, timestamp: pd.Timestamp, quantity: float) -> None:
         reserved = self.order_manager.reserved_for_order(order.order_id)
         if reserved > 0:
             self._log(
@@ -240,93 +256,164 @@ class Backtester:
     # ------------------------------------------------------------------- main
 
     def run(self) -> pd.DataFrame:
-        for row in self.data_gateway.stream():
-            self.market_history.append(row)
-            market_df = pd.DataFrame(self.market_history)
-            if hasattr(self.strategy, "update_context"):
-                try:
-                    self.strategy.update_context(position=self.order_manager.net_position)
-                except TypeError:
-                    # Backwards compatibility if a strategy ignores context.
-                    pass
-
-            signals_df = self.strategy.run(market_df)
-            latest = signals_df.iloc[-1]
-            timestamp = pd.Timestamp(row["Datetime"])
-
-            price = float(latest["Close"])
-            self._update_equity(price)
-
-            # ------------------------------------------------------------------
-            # Strategy can either emit per-side quotes (bid/ask) or a single
-            # directional signal (legacy). Prefer the richer quote interface.
-            # ------------------------------------------------------------------
-            submitted_any = False
-
-            if {"bid_price", "ask_price"} <= set(signals_df.columns):
-                orders_to_submit = []
-
-                bid_active = bool(latest.get("bid_active", True))
-                ask_active = bool(latest.get("ask_active", True))
-                bid_price = latest.get("bid_price")
-                ask_price = latest.get("ask_price")
-
-                if bid_active and pd.notna(bid_price):
-                    bid_qty_val = latest.get("bid_qty", self.default_position_size)
-                    bid_qty = int(bid_qty_val) if pd.notna(bid_qty_val) and bid_qty_val > 0 else self.default_position_size
-                    orders_to_submit.append((1, float(bid_price), bid_qty))
-
-                if ask_active and pd.notna(ask_price):
-                    ask_qty_val = latest.get("ask_qty", self.default_position_size)
-                    ask_qty = int(ask_qty_val) if pd.notna(ask_qty_val) and ask_qty_val > 0 else self.default_position_size
-                    orders_to_submit.append((-1, float(ask_price), ask_qty))
-
-                for sig, px, qty in orders_to_submit:
-                    order = self._create_order(sig, px, timestamp, qty)
-                    eligible, reason = self._asset_eligibility(order)
-                    if not eligible:
-                        self._log("rejected", {"order_id": order.order_id, "reason": reason})
-                        continue
-                    valid, reason = self.order_manager.validate(
-                        order,
-                        reference_price=float(latest["Close"]),
-                        paper_parity=self.paper_parity,
-                    )
-                    if not valid:
-                        self._log("rejected", {"order_id": order.order_id, "reason": reason})
-                        continue
-                    self._submit_order(order, timestamp, qty)
-                    submitted_any = True
-
-            if submitted_any:
-                continue
-
-            # Fallback: classic single signal / limit_price pattern.
-            signal_value = latest.get("signal", 0)
-            signal = int(signal_value) if pd.notna(signal_value) else 0
-            if signal == 0:
-                continue
-
-            limit_price = latest.get("limit_price", latest["Close"])
-            price = float(limit_price) if pd.notna(limit_price) else float(latest["Close"])
-            qty_value = latest.get("target_qty", self.default_position_size)
-            qty = int(qty_value) if pd.notna(qty_value) and qty_value > 0 else self.default_position_size
-
-            order = self._create_order(signal, price, timestamp, qty)
-            eligible, reason = self._asset_eligibility(order)
-            if not eligible:
-                self._log("rejected", {"order_id": order.order_id, "reason": reason})
-                continue
-            valid, reason = self.order_manager.validate(
-                order,
-                reference_price=float(latest["Close"]),
-                paper_parity=self.paper_parity,
+        stream_iter = self.data_gateway.stream()
+        progress = None
+        if self.show_progress:
+            total = int(getattr(self.data_gateway, "length", 0) or 0)
+            progress = tqdm(
+                stream_iter,
+                total=total if total > 0 else None,
+                desc=f"Backtest {getattr(self.data_gateway, 'symbol', 'ASSET')}",
+                unit="bar",
+                dynamic_ncols=True,
             )
-            if not valid:
-                self._log("rejected", {"order_id": order.order_id, "reason": reason})
-                continue
+            row_iter = progress
+        else:
+            row_iter = stream_iter
 
-            self._submit_order(order, timestamp, qty)
+        try:
+            for row in row_iter:
+                self.market_history.append(row)
+                market_df = pd.DataFrame(self.market_history)
+                if hasattr(self.strategy, "update_context"):
+                    try:
+                        self.strategy.update_context(position=self.order_manager.net_position)
+                    except TypeError:
+                        # Backwards compatibility if a strategy ignores context.
+                        pass
+
+                strategy_df = market_df
+                required_lookback = int(getattr(self.strategy, "required_lookback", 0) or 0)
+                if required_lookback > 0 and len(market_df) > required_lookback:
+                    strategy_df = market_df.iloc[-required_lookback:]
+
+                signals_df = self.strategy.run(strategy_df)
+                latest = signals_df.iloc[-1]
+                timestamp = pd.Timestamp(row["Datetime"])
+
+                price = float(latest["Close"])
+                self._update_equity(price)
+
+                # ------------------------------------------------------------------
+                # Strategy can either emit per-side quotes (bid/ask) or a single
+                # directional signal (legacy). Prefer the richer quote interface.
+                # ------------------------------------------------------------------
+                submitted_any = False
+
+                if {"bid_price", "ask_price"} <= set(signals_df.columns):
+                    orders_to_submit = []
+
+                    bid_active = bool(latest.get("bid_active", True))
+                    ask_active = bool(latest.get("ask_active", True))
+                    bid_price = latest.get("bid_price")
+                    ask_price = latest.get("ask_price")
+
+                    if bid_active and pd.notna(bid_price):
+                        bid_qty_val = latest.get("bid_qty", self.default_position_size)
+                        bid_qty = (
+                            float(bid_qty_val)
+                            if pd.notna(bid_qty_val) and bid_qty_val > 0
+                            else float(self.default_position_size)
+                        )
+                        orders_to_submit.append((1, float(bid_price), bid_qty))
+
+                    if ask_active and pd.notna(ask_price):
+                        ask_qty_val = latest.get("ask_qty", self.default_position_size)
+                        ask_qty = (
+                            float(ask_qty_val)
+                            if pd.notna(ask_qty_val) and ask_qty_val > 0
+                            else float(self.default_position_size)
+                        )
+                        orders_to_submit.append((-1, float(ask_price), ask_qty))
+
+                    for sig, px, qty in orders_to_submit:
+                        if self.asset_class == "crypto" and sig < 0:
+                            net_pos = float(self.order_manager.net_position)
+                            if net_pos <= 0:
+                                self._log(
+                                    "rejected",
+                                    {
+                                        "order_id": "pending",
+                                        "reason": "crypto shorting disabled",
+                                    },
+                                )
+                                continue
+                            qty = min(float(qty), net_pos)
+                            qty = np.floor(qty * 1_000_000.0) / 1_000_000.0
+                            if qty <= 0:
+                                continue
+                        order = self._create_order(sig, px, timestamp, qty)
+                        eligible, reason = self._asset_eligibility(order)
+                        if not eligible:
+                            self._log("rejected", {"order_id": order.order_id, "reason": reason})
+                            continue
+                        valid, reason = self.order_manager.validate(
+                            order,
+                            reference_price=float(latest["Close"]),
+                            paper_parity=self.paper_parity,
+                        )
+                        if not valid:
+                            self._log("rejected", {"order_id": order.order_id, "reason": reason})
+                            continue
+                        self._submit_order(order, timestamp, qty)
+                        submitted_any = True
+
+                if submitted_any:
+                    continue
+
+                # Fallback: classic single signal / limit_price pattern.
+                signal_value = latest.get("signal", 0)
+                signal = int(signal_value) if pd.notna(signal_value) else 0
+                if signal == 0:
+                    continue
+
+                limit_price = latest.get("limit_price", latest["Close"])
+                price = float(limit_price) if pd.notna(limit_price) else float(latest["Close"])
+                qty_value = latest.get("target_qty", self.default_position_size)
+                qty_raw = (
+                    float(qty_value)
+                    if pd.notna(qty_value) and float(qty_value) > 0
+                    else float(self.default_position_size)
+                )
+                if qty_raw <= 0:
+                    continue
+
+                if self.asset_class == "crypto":
+                    qty = np.floor((qty_raw / max(price, 1e-12)) * 1_000_000.0) / 1_000_000.0
+                    if qty <= 0:
+                        continue
+                    if signal < 0:
+                        net_pos = float(self.order_manager.net_position)
+                        if net_pos <= 0:
+                            self._log("rejected", {"order_id": "pending", "reason": "crypto shorting disabled"})
+                            continue
+                        qty = min(qty, net_pos)
+                        qty = np.floor(qty * 1_000_000.0) / 1_000_000.0
+                        if qty <= 0:
+                            continue
+                else:
+                    qty = float(int(qty_raw))
+                    if qty <= 0:
+                        continue
+
+                order = self._create_order(signal, price, timestamp, qty)
+                eligible, reason = self._asset_eligibility(order)
+                if not eligible:
+                    self._log("rejected", {"order_id": order.order_id, "reason": reason})
+                    continue
+                valid, reason = self.order_manager.validate(
+                    order,
+                    reference_price=float(latest["Close"]),
+                    paper_parity=self.paper_parity,
+                )
+                if not valid:
+                    self._log("rejected", {"order_id": order.order_id, "reason": reason})
+                    continue
+
+                self._submit_order(order, timestamp, qty)
+        finally:
+            if progress is not None:
+                progress.close()
 
         return pd.DataFrame(
             {
