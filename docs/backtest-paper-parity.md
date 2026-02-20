@@ -64,6 +64,47 @@ This document maps the current behavior of this repository against Alpaca paper 
 5. Multi-asset backtest fills are immediate and optimistic relative to real order lifecycle.
 6. Backtests do not model open-order reservation effects on buying power the same way as paper trading.
 
+## Paper-Parity V1 scope (issue #2)
+
+This repository's parity v1 scope is intentionally narrow and targets the highest-impact gaps first:
+- limitation **#1** (asset flags not enforced),
+- limitation **#3** (short opens without realistic constraints),
+- limitation **#6** (no open-order buying-power reservation),
+- plus Alpaca short-open valuation guidance from this doc: `max(limit_price, ask_price * 1.03) * quantity`.
+
+### In scope
+- Enforce tradable/short-related asset eligibility in backtests.
+- Improve short-open sizing realism with explicit buying-power checks.
+- Add open-order buying-power reservation semantics for accepted-but-not-filled orders.
+
+### Out of scope for v1
+- Full PDT/DTMC simulation.
+- Full broker lifecycle/status parity for all order types and venues.
+- Full quote-driven fill realism replacement for current synthetic model.
+
+### Implementation map (scope item -> touchpoints)
+
+| Scope item | Primary touchpoints | Why this is the right seam |
+|---|---|---|
+| Asset eligibility checks (`tradable`, `shortable`, `easy_to_borrow`) | `run_backtest.py`, `core/order_manager.py`, `core/backtester.py`, `core/multi_asset_backtester.py` | `run_backtest.py` can load/configure symbol flags; order acceptance is centralized in manager/backtest execution paths. |
+| Short-open sizing realism + 1.03 valuation rule | `core/order_manager.py`, `core/backtester.py`, `core/multi_asset_backtester.py` | Order validation is where open-vs-close intent and buying-power math should be enforced consistently. |
+| Open-order buying-power reservation | `core/order_manager.py`, `core/backtester.py`, `core/multi_asset_backtester.py` | Reservation state belongs with portfolio/risk state; submit/fill/cancel hooks live in the execution loops. |
+| Multi-asset cap wiring from CLI for parity operation | `run_backtest.py`, `core/multi_asset_backtester.py` | Existing engine supports notional caps, but CLI needs explicit parity controls to make behavior reproducible. |
+
+### Rollout order (MVP first)
+
+1. **PR 1 (MVP parity controls):**
+   - Add parity configuration surface and CLI wiring.
+   - Implement asset eligibility gating.
+   - Implement short-open valuation checks (`max(limit_price, ref_price * 1.03) * qty`).
+   - Add baseline tests for these checks.
+2. **PR 2 (reservation semantics):**
+   - Add open-order buying-power reservation/release lifecycle.
+   - Add regression tests for reservation behavior under concurrent orders.
+   - Update usage docs with reject semantics and parity-mode examples.
+
+This split keeps v1 small enough for one focused PR plus one follow-up hardening PR.
+
 ## Parity-safe operating rules (recommended)
 
 1. **Use stock-only strategies for parity with current multi-asset paper runner**.
