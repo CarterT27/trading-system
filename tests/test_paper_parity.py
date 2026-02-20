@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from core.asset_eligibility import normalize_asset_flags_by_symbol
 from core.backtester import Backtester
 from core.multi_asset_backtester import MultiAssetBacktester
 from core.order_book import Order, OrderBook
@@ -594,6 +595,70 @@ class PaperParityReservationTests(unittest.TestCase):
         self.assertIn("reserve", reservation_actions)
         self.assertIn("release", reservation_actions)
 
+    def test_max_short_notional_reject_does_not_leak_reservation(self) -> None:
+        cfg = PaperParityConfig(
+            enabled=True,
+            reserve_open_orders=True,
+            buying_power=BuyingPowerConfig(mode="multiplier", explicit_multiplier=4.0),
+            account_equity=100_000.0,
+        )
+        panel = pd.DataFrame(
+            {
+                "Datetime": [
+                    pd.Timestamp("2024-01-01T09:30:00Z"),
+                    pd.Timestamp("2024-01-01T09:30:00Z"),
+                ],
+                "symbol": ["AAPL", "MSFT"],
+                "Open": [100.0, 100.0],
+                "High": [101.0, 101.0],
+                "Low": [99.0, 99.0],
+                "Close": [100.0, 100.0],
+                "Volume": [1_000, 1_000],
+            }
+        )
+
+        class _PortfolioStrategy:
+            required_lookback = 1
+
+            def run_panel(self, panel_df, current_positions=None):
+                ts = panel_df["Datetime"].max()
+                return pd.DataFrame(
+                    [
+                        {
+                            "Datetime": ts,
+                            "symbol": "AAPL",
+                            "signal": -1,
+                            "target_qty": 20,
+                            "limit_price": 100.0,
+                        },
+                        {
+                            "Datetime": ts,
+                            "symbol": "MSFT",
+                            "signal": 1,
+                            "target_qty": 5,
+                            "limit_price": 100.0,
+                        },
+                    ]
+                )
+
+        multi = MultiAssetBacktester(
+            panel_df=panel,
+            strategy_factory=lambda: _PortfolioStrategy(),
+            initial_capital=1_000.0,
+            max_short_notional=500.0,
+            paper_parity=cfg,
+        )
+        multi.run()
+
+        self.assertEqual(len(multi.trades), 1)
+        self.assertEqual(multi.trades[0].symbol, "MSFT")
+        self.assertEqual(multi.trades[0].side, "buy")
+        self.assertEqual(multi.trades[0].qty, 5)
+        self.assertNotIn(
+            "reject_reserved_buying_power",
+            [item.get("reason") for item in multi.rejections],
+        )
+
 
 class RunBacktestCliWiringTests(unittest.TestCase):
     def test_parse_args_reads_multi_asset_caps(self) -> None:
@@ -633,6 +698,27 @@ class RunBacktestCliWiringTests(unittest.TestCase):
         self.assertFalse(flags["AAPL"].shortable)
         self.assertFalse(flags["AAPL"].easy_to_borrow)
 
+    def test_load_asset_flags_by_symbol_parses_float_bool_values(self) -> None:
+        csv_path = "tests/.tmp_asset_flags_float_bool.csv"
+        df = pd.DataFrame(
+            {
+                "symbol": ["AAPL", "MSFT"],
+                "tradable": [1.0, 1.0],
+                "shortable": [0.0, 1.0],
+                "easy_to_borrow": [0.0, 1.0],
+            }
+        )
+        df.to_csv(csv_path, index=False)
+        try:
+            flags = load_asset_flags_by_symbol(Path(csv_path))
+        finally:
+            if os.path.exists(csv_path):
+                os.remove(csv_path)
+
+        self.assertFalse(flags["AAPL"].shortable)
+        self.assertFalse(flags["AAPL"].easy_to_borrow)
+        self.assertTrue(flags["MSFT"].shortable)
+
     def test_buy_to_cover_not_blocked_by_short_open_rule(self) -> None:
         cfg = PaperParityConfig(
             enabled=True,
@@ -654,6 +740,22 @@ class RunBacktestCliWiringTests(unittest.TestCase):
             paper_parity=cfg,
         )
         self.assertTrue(valid)
+
+
+class AssetEligibilityNormalizationTests(unittest.TestCase):
+    def test_normalize_asset_flags_parses_string_false_values(self) -> None:
+        flags = normalize_asset_flags_by_symbol(
+            {
+                "AAPL": {
+                    "tradable": "true",
+                    "shortable": "false",
+                    "easy_to_borrow": "0",
+                }
+            }
+        )
+        self.assertTrue(flags["AAPL"].tradable)
+        self.assertFalse(flags["AAPL"].shortable)
+        self.assertFalse(flags["AAPL"].easy_to_borrow)
 
 
 if __name__ == "__main__":

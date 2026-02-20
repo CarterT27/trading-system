@@ -327,6 +327,16 @@ class MultiAssetBacktester:
             self.cash -= qty * price
             self.position_by_symbol[symbol] = current + qty
         else:
+            projected_position = current - qty
+            if projected_position < 0 and self.max_short_notional is not None:
+                projected_short_notional = self._projected_total_short_notional(
+                    symbol=symbol,
+                    new_qty=projected_position,
+                    trade_price=price,
+                )
+                if projected_short_notional > float(self.max_short_notional):
+                    return
+
             opening_short_qty = max(0, qty - max(0, current))
             if opening_short_qty > 0 and self.paper_parity.enabled:
                 reference_price = self.latest_price_by_symbol.get(symbol, price)
@@ -407,18 +417,8 @@ class MultiAssetBacktester:
                         "amount": reservation,
                     }
                 )
-
-            projected_position = current - qty
-            if projected_position < 0 and self.max_short_notional is not None:
-                projected_short_notional = self._projected_total_short_notional(
-                    symbol=symbol,
-                    new_qty=projected_position,
-                    trade_price=price,
-                )
-                if projected_short_notional > float(self.max_short_notional):
-                    return
             self.cash += qty * price
-            self.position_by_symbol[symbol] = current - qty
+            self.position_by_symbol[symbol] = projected_position
 
         self.trades.append(
             MultiAssetTradeRecord(

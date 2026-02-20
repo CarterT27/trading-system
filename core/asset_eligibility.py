@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Mapping, Optional
 
 from core.paper_parity import PaperParityConfig
@@ -19,6 +20,29 @@ class AssetEligibilityFlags:
     easy_to_borrow: bool = True
 
 
+def parse_asset_flag_bool(value: Any, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if math.isnan(numeric):
+            return default
+        if numeric == 1.0:
+            return True
+        if numeric == 0.0:
+            return False
+        return default
+
+    text = str(value).strip().lower()
+    if text in {"1", "1.0", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "0.0", "false", "f", "no", "n"}:
+        return False
+    return default
+
+
 def normalize_asset_flags_by_symbol(
     raw: Optional[Mapping[str, Any]],
 ) -> dict[str, AssetEligibilityFlags]:
@@ -35,9 +59,12 @@ def normalize_asset_flags_by_symbol(
             continue
         if isinstance(value, Mapping):
             out[sym] = AssetEligibilityFlags(
-                tradable=bool(value.get("tradable", True)),
-                shortable=bool(value.get("shortable", True)),
-                easy_to_borrow=bool(value.get("easy_to_borrow", True)),
+                tradable=parse_asset_flag_bool(value.get("tradable", True), default=True),
+                shortable=parse_asset_flag_bool(value.get("shortable", True), default=True),
+                easy_to_borrow=parse_asset_flag_bool(
+                    value.get("easy_to_borrow", True),
+                    default=True,
+                ),
             )
             continue
         raise TypeError(

@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from core.asset_eligibility import AssetEligibilityFlags
+from core.asset_eligibility import AssetEligibilityFlags, parse_asset_flag_bool
 from core.backtester import Backtester, PerformanceAnalyzer, plot_equity
 from core.gateway import MarketDataGateway
 from core.matching_engine import MatchingEngine
@@ -36,16 +36,7 @@ DATA_DIR = Path("data")
 
 
 def _parse_bool(value: object, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "t", "yes", "y"}:
-        return True
-    if text in {"0", "false", "f", "no", "n"}:
-        return False
-    return default
+    return parse_asset_flag_bool(value, default=default)
 
 
 def load_asset_flags_by_symbol(path: Path) -> dict[str, AssetEligibilityFlags]:
