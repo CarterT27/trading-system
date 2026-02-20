@@ -12,7 +12,8 @@ from alpaca_trade_api.rest import APIError
 
 from core.logger import get_logger, get_trade_logger
 from core.rate_limiter import RequestRateLimiter
-from pipeline.alpaca import _parse_timeframe, get_rest
+from pipeline.alpaca import _parse_timeframe, fetch_crypto_bars, get_rest
+from core.alpaca_trader import normalize_crypto_symbols
 from strategies import Strategy
 
 logger = get_logger("multi_asset_trader")
@@ -57,6 +58,7 @@ class MultiAssetAlpacaTrader:
     def __init__(
         self,
         symbols: List[str],
+        asset_class: str,
         timeframe: str,
         lookback: int,
         strategy_factory: Callable[[], Strategy],
@@ -77,10 +79,36 @@ class MultiAssetAlpacaTrader:
         if lookback <= 0:
             raise ValueError("lookback must be positive")
 
-        self.symbols = [s.strip().upper() for s in symbols if s.strip()]
+        asset_class = str(asset_class).strip().lower()
+        if asset_class not in {"stock", "crypto"}:
+            raise ValueError("asset_class must be 'stock' or 'crypto'.")
+        self.asset_class = asset_class
+
+        raw_symbols = [s.strip().upper() for s in symbols if s.strip()]
+        self.symbols: List[str] = []
+        self.trade_symbol_by_symbol: Dict[str, str] = {}
+        self.symbol_by_trade_symbol: Dict[str, str] = {}
+        for sym in raw_symbols:
+            if self.asset_class == "crypto":
+                trade_symbol, data_symbol = normalize_crypto_symbols(sym)
+                data_symbol = data_symbol.upper()
+                trade_symbol = trade_symbol.upper()
+                if "/" not in data_symbol:
+                    raise ValueError(
+                        f"Crypto symbol '{sym}' must include quote currency (e.g., BTC/USD or BTCUSD)."
+                    )
+            else:
+                data_symbol = sym
+                trade_symbol = sym
+
+            if data_symbol not in self.trade_symbol_by_symbol:
+                self.symbols.append(data_symbol)
+            self.trade_symbol_by_symbol[data_symbol] = trade_symbol
+            self.symbol_by_trade_symbol[trade_symbol] = data_symbol
+
         self.timeframe = timeframe
         self.lookback = int(lookback)
-        self.feed = feed or "iex"
+        self.feed = feed or ("iex" if self.asset_class == "stock" else None)
         self.dry_run = dry_run
         self.max_order_notional = (
             float(max_order_notional) if max_order_notional is not None else None
@@ -132,7 +160,8 @@ class MultiAssetAlpacaTrader:
         self.latest_equity = self.starting_equity
 
         logger.info(
-            "Initialized multi-asset trader: symbols=%s timeframe=%s lookback=%s dry_run=%s portfolio_mode=%s",
+            "Initialized multi-asset trader: asset_class=%s symbols=%s timeframe=%s lookback=%s dry_run=%s portfolio_mode=%s",
+            self.asset_class,
             len(self.symbols),
             self.timeframe,
             self.required_lookback,
@@ -190,6 +219,8 @@ class MultiAssetAlpacaTrader:
     def _fetch_batch_bars(
         self, symbols: List[str], start: pd.Timestamp, end: pd.Timestamp
     ) -> pd.DataFrame:
+        if self.asset_class != "stock":
+            raise RuntimeError("_fetch_batch_bars is only valid for stock mode.")
         tf = str(_parse_timeframe(self.timeframe))
         page_token: Optional[str] = None
         chunks: List[pd.DataFrame] = []
@@ -250,6 +281,43 @@ class MultiAssetAlpacaTrader:
         return out
 
     def _fetch_market_panel(self) -> pd.DataFrame:
+        if self.asset_class == "crypto":
+            panel_parts: List[pd.DataFrame] = []
+            for symbol in self.symbols:
+                try:
+                    bars = fetch_crypto_bars(
+                        symbol,
+                        timeframe=self.timeframe,
+                        limit=self.required_lookback,
+                        api=self.api,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping %s after fetch errors: %s",
+                        symbol,
+                        exc,
+                    )
+                    continue
+                if bars.empty:
+                    continue
+                local = bars.copy()
+                local["symbol"] = symbol
+                panel_parts.append(
+                    local[
+                        ["Datetime", "symbol", "Open", "High", "Low", "Close", "Volume"]
+                    ].copy()
+                )
+
+            if not panel_parts:
+                return pd.DataFrame(
+                    columns=["Datetime", "symbol", "Open", "High", "Low", "Close", "Volume"]
+                )
+            panel = pd.concat(panel_parts, ignore_index=True)
+            panel = panel.sort_values(["Datetime", "symbol"]).drop_duplicates(
+                ["Datetime", "symbol"], keep="last"
+            )
+            return panel
+
         end = pd.Timestamp.now(tz="UTC").floor("min")
         if self.last_fetch_end is None:
             start = end - self.timeframe_delta * (self.required_lookback + 2)
@@ -327,9 +395,10 @@ class MultiAssetAlpacaTrader:
         positions = self._api_call(self.api.list_positions)
         out: Dict[str, float] = {}
         for pos in positions:
-            symbol = str(getattr(pos, "symbol", "")).upper()
-            if not symbol:
+            trade_symbol = str(getattr(pos, "symbol", "")).upper()
+            if not trade_symbol:
                 continue
+            symbol = self.symbol_by_trade_symbol.get(trade_symbol, trade_symbol)
             qty = float(getattr(pos, "qty", 0.0))
             if getattr(pos, "side", "long") == "short":
                 qty = -qty
@@ -338,7 +407,13 @@ class MultiAssetAlpacaTrader:
 
     def _list_open_order_symbols(self) -> set[str]:
         orders = self._api_call(self.api.list_orders, status="open")
-        return {str(getattr(order, "symbol", "")).upper() for order in orders}
+        out: set[str] = set()
+        for order in orders:
+            trade_symbol = str(getattr(order, "symbol", "")).upper()
+            if not trade_symbol:
+                continue
+            out.add(self.symbol_by_trade_symbol.get(trade_symbol, trade_symbol))
+        return out
 
     @staticmethod
     def _normalize_stock_limit_price(price: float) -> float:
@@ -360,7 +435,7 @@ class MultiAssetAlpacaTrader:
 
         limit_value = latest.get("limit_price", None)
         limit_price = float(limit_value) if pd.notna(limit_value) else None
-        if limit_price is not None:
+        if self.asset_class == "stock" and limit_price is not None:
             limit_price = self._normalize_stock_limit_price(limit_price)
             if limit_price <= 0:
                 return None, "invalid limit price"
@@ -369,7 +444,11 @@ class MultiAssetAlpacaTrader:
 
         qty_value = latest.get("target_qty", 0)
         qty = float(qty_value) if pd.notna(qty_value) else 0.0
-        qty = float(int(max(0.0, qty)))
+        qty = max(0.0, qty)
+        if self.asset_class == "stock":
+            qty = float(int(qty))
+        else:
+            qty = np.floor(qty * 1_000_000.0) / 1_000_000.0
         if qty <= 0:
             return None, "target_qty is zero"
 
@@ -380,13 +459,21 @@ class MultiAssetAlpacaTrader:
         else:
             return None, "no signal"
 
-        if side == "buy" and net_position > 0:
-            return None, "already long"
-        if side == "sell" and net_position < 0:
-            return None, "already short"
+        if self.portfolio_strategy is None:
+            if side == "buy" and net_position > 0:
+                return None, "already long"
+            if side == "sell" and net_position < 0:
+                return None, "already short"
+
+        if self.asset_class == "crypto" and side == "sell" and net_position <= 0:
+            return None, "crypto shorting disabled"
 
         if self.max_order_notional is not None and price_for_qty > 0:
-            max_qty = float(int(self.max_order_notional / price_for_qty))
+            max_qty = float(self.max_order_notional) / float(price_for_qty)
+            if self.asset_class == "stock":
+                max_qty = float(int(max_qty))
+            else:
+                max_qty = np.floor(max_qty * 1_000_000.0) / 1_000_000.0
             qty = min(qty, max_qty)
         if qty <= 0:
             return None, "quantity too small after notional cap"
@@ -429,20 +516,29 @@ class MultiAssetAlpacaTrader:
         if self.dry_run:
             return "dry_run"
 
-        qty = float(int(max(0.0, decision.qty)))
+        qty = float(max(0.0, decision.qty))
+        if self.asset_class == "stock":
+            qty = float(int(qty))
+        else:
+            qty = np.floor(qty * 1_000_000.0) / 1_000_000.0
         if qty <= 0:
             raise ValueError("Order quantity must be positive.")
 
-        kwargs = {"type": decision.order_type, "time_in_force": "day"}
+        kwargs = {
+            "type": decision.order_type,
+            "time_in_force": "gtc" if self.asset_class == "crypto" else "day",
+        }
         if decision.order_type == "limit" and decision.limit_price is not None:
-            kwargs["limit_price"] = self._normalize_stock_limit_price(
-                float(decision.limit_price)
-            )
+            limit_price = float(decision.limit_price)
+            if self.asset_class == "stock":
+                limit_price = self._normalize_stock_limit_price(limit_price)
+            kwargs["limit_price"] = limit_price
 
+        trade_symbol = self.trade_symbol_by_symbol.get(decision.symbol, decision.symbol)
         order = self._api_call(
             self.api.submit_order,
-            symbol=decision.symbol,
-            qty=int(qty),
+            symbol=trade_symbol,
+            qty=int(qty) if self.asset_class == "stock" else float(qty),
             side=decision.side,
             **kwargs,
         )
@@ -485,19 +581,31 @@ class MultiAssetAlpacaTrader:
         position_qty: float,
         remaining_buying_power: float,
     ) -> tuple[float, float]:
-        qty = float(int(max(0.0, decision.qty)))
+        qty = float(max(0.0, decision.qty))
+        if self.asset_class == "stock":
+            qty = float(int(qty))
+        else:
+            qty = np.floor(qty * 1_000_000.0) / 1_000_000.0
         price = self._effective_price(decision)
         if qty <= 0 or price <= 0:
             return 0.0, 0.0
 
-        affordable_incremental = float(int(max(0.0, remaining_buying_power / price)))
+        affordable_incremental = max(0.0, float(remaining_buying_power) / float(price))
+        if self.asset_class == "stock":
+            affordable_incremental = float(int(affordable_incremental))
+        else:
+            affordable_incremental = np.floor(affordable_incremental * 1_000_000.0) / 1_000_000.0
         if decision.side == "buy":
             flatten_qty = min(qty, max(0.0, -position_qty))
         else:
             flatten_qty = min(qty, max(0.0, position_qty))
 
         capped_qty = min(qty, flatten_qty + affordable_incremental)
-        capped_qty = float(int(max(0.0, capped_qty)))
+        capped_qty = max(0.0, float(capped_qty))
+        if self.asset_class == "stock":
+            capped_qty = float(int(capped_qty))
+        else:
+            capped_qty = np.floor(capped_qty * 1_000_000.0) / 1_000_000.0
         if capped_qty <= 0:
             return 0.0, 0.0
 
@@ -627,7 +735,13 @@ class MultiAssetAlpacaTrader:
             position_qty = float(working_position_map.get(decision.symbol, 0.0))
             adjusted_qty = decision.qty
             if decision.side == "sell" and position_qty > 0:
-                adjusted_qty = min(adjusted_qty, float(int(position_qty)))
+                if self.asset_class == "stock":
+                    max_sell_qty = float(int(position_qty))
+                else:
+                    max_sell_qty = (
+                        np.floor(float(position_qty) * 1_000_000.0) / 1_000_000.0
+                    )
+                adjusted_qty = min(adjusted_qty, max_sell_qty)
 
             adjusted_qty, reserved_buying_power = self._cap_qty_for_buying_power(
                 decision,
@@ -643,8 +757,8 @@ class MultiAssetAlpacaTrader:
                 logger.debug(
                     "Adjusted %s sell qty from %s to %s based on live position.",
                     decision.symbol,
-                    int(decision.qty),
-                    int(adjusted_qty),
+                    (f"{decision.qty:.6f}".rstrip("0").rstrip(".") if self.asset_class == "crypto" else int(decision.qty)),
+                    (f"{adjusted_qty:.6f}".rstrip("0").rstrip(".") if self.asset_class == "crypto" else int(adjusted_qty)),
                 )
             order_decision = replace(decision, qty=adjusted_qty)
 
@@ -656,15 +770,26 @@ class MultiAssetAlpacaTrader:
                     order_decision.side == "sell"
                     and available_qty is not None
                     and available_qty > 0
-                    and int(available_qty) < int(order_decision.qty)
+                    and float(available_qty) < float(order_decision.qty)
                 ):
-                    retry_qty = float(int(available_qty))
+                    if self.asset_class == "stock":
+                        retry_qty = float(int(available_qty))
+                    else:
+                        retry_qty = np.floor(float(available_qty) * 1_000_000.0) / 1_000_000.0
                     retry_decision = replace(order_decision, qty=retry_qty)
                     logger.warning(
                         "Order rejected for %s with qty=%s; retrying with available qty=%s",
                         retry_decision.symbol,
-                        int(order_decision.qty),
-                        int(retry_qty),
+                        (
+                            f"{order_decision.qty:.6f}".rstrip("0").rstrip(".")
+                            if self.asset_class == "crypto"
+                            else int(order_decision.qty)
+                        ),
+                        (
+                            f"{retry_qty:.6f}".rstrip("0").rstrip(".")
+                            if self.asset_class == "crypto"
+                            else int(retry_qty)
+                        ),
                     )
                     try:
                         order_id = self._submit_order(retry_decision)
@@ -724,7 +849,11 @@ class MultiAssetAlpacaTrader:
             logger.info(
                 "%s %s %s @ %.2f | order_id=%s | equity=$%.2f | net_pnl=%+.2f",
                 order_decision.side.upper(),
-                int(order_decision.qty),
+                (
+                    f"{order_decision.qty:.6f}".rstrip("0").rstrip(".")
+                    if self.asset_class == "crypto"
+                    else int(order_decision.qty)
+                ),
                 order_decision.symbol,
                 print_price,
                 order_id,

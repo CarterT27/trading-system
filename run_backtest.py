@@ -27,6 +27,7 @@ from core.symbols import resolve_symbols
 from strategies import (
     CrossSectionalPaperReversalStrategy,
     CryptoCompetitionStrategy,
+    CryptoCompetitionPortfolioStrategy,
     MovingAverageStrategy,
     TemplateStrategy,
     get_strategy_class,
@@ -249,6 +250,101 @@ def parse_args() -> argparse.Namespace:
         "--position-size", type=float, default=10.0, help="Per-trade position size."
     )
     parser.add_argument(
+        "--portfolio-notional",
+        type=float,
+        default=100_000.0,
+        help="Portfolio gross notional budget for multi-asset competition portfolio strategy.",
+    )
+    parser.add_argument(
+        "--portfolio-min-order-notional",
+        type=float,
+        default=5.0,
+        help="Skip portfolio rebalancing deltas smaller than this notional.",
+    )
+    parser.add_argument(
+        "--portfolio-fractional-qty",
+        dest="portfolio_fractional_qty",
+        action="store_true",
+        help="Allow fractional target_qty in portfolio strategy (default).",
+    )
+    parser.add_argument(
+        "--portfolio-integer-qty",
+        dest="portfolio_fractional_qty",
+        action="store_false",
+        help="Force integer target_qty in portfolio strategy.",
+    )
+    parser.add_argument(
+        "--meta-no-trade-band",
+        type=float,
+        default=0.03,
+        help="Hysteresis half-band around meta threshold for crypto competition strategy.",
+    )
+    parser.add_argument(
+        "--meta-use-xgboost",
+        action="store_true",
+        help="Include optional XGBoost leg in crypto competition strategy meta ensemble.",
+    )
+    parser.add_argument(
+        "--meta-prob-threshold",
+        type=float,
+        default=0.50,
+        help="Meta probability threshold for crypto competition strategy.",
+    )
+    parser.add_argument(
+        "--meta-refit-interval",
+        type=int,
+        default=120,
+        help="Bars between meta-model refits for crypto competition strategy.",
+    )
+    parser.add_argument(
+        "--meta-train-window",
+        type=int,
+        default=3000,
+        help="Rolling training window for meta model (<=0 disables and uses full history).",
+    )
+    parser.add_argument(
+        "--sizing-scale",
+        type=float,
+        default=1.5,
+        help="Dynamic sizing scale for crypto competition strategy.",
+    )
+    parser.add_argument(
+        "--sizing-offset",
+        type=float,
+        default=0.3,
+        help="Dynamic sizing offset for crypto competition strategy.",
+    )
+    parser.add_argument(
+        "--sizing-min-size",
+        type=float,
+        default=0.05,
+        help="Minimum dynamic position fraction for crypto competition strategy.",
+    )
+    parser.add_argument(
+        "--exit-time-bars",
+        type=int,
+        default=180,
+        help="Time-stop bars for crypto competition strategy (<=0 disables).",
+    )
+    parser.add_argument(
+        "--exit-trail-stop",
+        type=float,
+        default=0.008,
+        help="Trailing-stop drawdown (fraction) for crypto competition strategy (<=0 disables).",
+    )
+    parser.add_argument(
+        "--exit-min-hold-bars",
+        type=int,
+        default=0,
+        help="Minimum hold bars before exit rules can trigger.",
+    )
+    parser.add_argument(
+        "--tail-bars",
+        type=int,
+        default=0,
+        help="Use only the last N cleaned bars from CSV (0 means all rows).",
+    )
+    parser.add_argument(
         "--momentum-lookback",
         type=int,
         default=14,
@@ -433,6 +529,7 @@ def parse_args() -> argparse.Namespace:
         reserve_open_orders=True,
         paper_parity=True,
         verbose_trades=True,
+        portfolio_fractional_qty=True,
     )
     return parser.parse_args()
 
@@ -476,8 +573,54 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
             sell_threshold=args.sell_threshold,
         )
     if strategy_cls is CryptoCompetitionStrategy:
+        meta_train_window = (
+            None if int(args.meta_train_window) <= 0 else int(args.meta_train_window)
+        )
+        exit_time_bars = (
+            None if int(args.exit_time_bars) <= 0 else int(args.exit_time_bars)
+        )
+        exit_trail_stop = (
+            None if float(args.exit_trail_stop) <= 0 else float(args.exit_trail_stop)
+        )
         return CryptoCompetitionStrategy(
             position_size=args.position_size,
+            meta_no_trade_band=args.meta_no_trade_band,
+            meta_use_xgboost=bool(args.meta_use_xgboost),
+            meta_prob_threshold=args.meta_prob_threshold,
+            meta_refit_interval=args.meta_refit_interval,
+            meta_train_window=meta_train_window,
+            sizing_scale=args.sizing_scale,
+            sizing_offset=args.sizing_offset,
+            sizing_min_size=args.sizing_min_size,
+            exit_time_bars=exit_time_bars,
+            exit_trail_stop=exit_trail_stop,
+            exit_min_hold_bars=args.exit_min_hold_bars,
+        )
+    if strategy_cls is CryptoCompetitionPortfolioStrategy:
+        meta_train_window = (
+            None if int(args.meta_train_window) <= 0 else int(args.meta_train_window)
+        )
+        exit_time_bars = (
+            None if int(args.exit_time_bars) <= 0 else int(args.exit_time_bars)
+        )
+        exit_trail_stop = (
+            None if float(args.exit_trail_stop) <= 0 else float(args.exit_trail_stop)
+        )
+        return CryptoCompetitionPortfolioStrategy(
+            portfolio_notional=args.portfolio_notional,
+            allow_fractional_qty=bool(args.portfolio_fractional_qty),
+            min_order_notional=args.portfolio_min_order_notional,
+            meta_no_trade_band=args.meta_no_trade_band,
+            meta_use_xgboost=bool(args.meta_use_xgboost),
+            meta_prob_threshold=args.meta_prob_threshold,
+            meta_refit_interval=args.meta_refit_interval,
+            meta_train_window=meta_train_window,
+            sizing_scale=args.sizing_scale,
+            sizing_offset=args.sizing_offset,
+            sizing_min_size=args.sizing_min_size,
+            exit_time_bars=exit_time_bars,
+            exit_trail_stop=exit_trail_stop,
+            exit_min_hold_bars=args.exit_min_hold_bars,
         )
     if strategy_cls is CrossSectionalPaperReversalStrategy:
         return CrossSectionalPaperReversalStrategy(
@@ -681,7 +824,10 @@ def main() -> None:
 
     strategy = strategy_probe
     single_asset_class = resolve_single_asset_class(args, strategy, csv_path)
-    gateway = MarketDataGateway(csv_path)
+    tail_bars = int(args.tail_bars) if int(args.tail_bars) > 0 else None
+    gateway = MarketDataGateway(csv_path, tail_bars=tail_bars)
+    if tail_bars is not None:
+        print(f"Using tail-bars mode: last {gateway.length} rows from {csv_path}")
     order_book = OrderBook()
     order_manager = OrderManager(
         capital=args.capital, max_long_position=1_000, max_short_position=1_000

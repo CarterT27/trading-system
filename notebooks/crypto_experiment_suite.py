@@ -276,22 +276,34 @@ def build_feature_universe(
 def simulate_equal_weight_positions(
     close_by_symbol: Dict[str, pd.Series],
     positions_by_symbol: Dict[str, pd.Series],
+    execution_model: str = "ideal",
+    execution_seed: int = 42,
+    full_fill_prob: float = 0.70,
+    partial_fill_prob: float = 0.20,
+    partial_fill_min: float = 0.10,
+    partial_fill_max: float = 0.90,
 ) -> Tuple[pd.Series, pd.Series, pd.Series, Dict[str, pd.Series]]:
     net_returns: Dict[str, pd.Series] = {}
     turnover: Dict[str, pd.Series] = {}
     exposure: Dict[str, pd.Series] = {}
 
-    for symbol, close in close_by_symbol.items():
+    for i, (symbol, close) in enumerate(close_by_symbol.items()):
         pos = positions_by_symbol[symbol].reindex(close.index).fillna(0.0).clip(-1.0, 1.0)
         sim = simulate_from_position(
             close=close,
             position=pos,
             cost_bps=0.0,
             bars_per_year=BARS_PER_YEAR_2M,
+            execution_model=execution_model,
+            random_seed=int(execution_seed) + int(i * 9973),
+            full_fill_prob=full_fill_prob,
+            partial_fill_prob=partial_fill_prob,
+            partial_fill_min=partial_fill_min,
+            partial_fill_max=partial_fill_max,
         )
         net_returns[symbol] = sim.net_returns
         turnover[symbol] = sim.turnover
-        exposure[symbol] = pos.shift(1).fillna(0.0).abs()
+        exposure[symbol] = sim.position.shift(1).fillna(0.0).abs()
 
     ret_wide = pd.concat(net_returns, axis=1).sort_index().fillna(0.0)
     turn_wide = pd.concat(turnover, axis=1).sort_index().fillna(0.0)

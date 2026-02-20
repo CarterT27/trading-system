@@ -23,7 +23,7 @@ class MultiAssetTradeRecord:
     timestamp: pd.Timestamp
     symbol: str
     side: str
-    qty: int
+    qty: float
     price: float
 
 
@@ -60,7 +60,7 @@ class MultiAssetBacktester:
             self.portfolio_strategy = strategy_probe
 
         self.cash = self.initial_capital
-        self.position_by_symbol: Dict[str, int] = {}
+        self.position_by_symbol: Dict[str, float] = {}
         self.latest_price_by_symbol: Dict[str, float] = {}
         self.max_history_rows = max(self.required_lookback + 20, 50)
         self.history_by_symbol: Dict[str, pd.DataFrame] = {
@@ -81,12 +81,12 @@ class MultiAssetBacktester:
     def _projected_total_short_notional(
         self,
         symbol: str,
-        new_qty: int,
+        new_qty: float,
         trade_price: float,
     ) -> float:
         total = 0.0
         for sym, qty in self.position_by_symbol.items():
-            projected_qty = new_qty if sym == symbol else int(qty)
+            projected_qty = float(new_qty) if sym == symbol else float(qty)
             if projected_qty >= 0:
                 continue
             px = trade_price if sym == symbol else self.latest_price_by_symbol.get(sym)
@@ -108,20 +108,20 @@ class MultiAssetBacktester:
             total += abs(qty) * float(px)
         return total
 
-    def _opening_long_qty(self, current_position: int, qty: int) -> int:
-        short_to_cover = max(0, -int(current_position))
-        return max(0, int(qty) - short_to_cover)
+    def _opening_long_qty(self, current_position: float, qty: float) -> float:
+        short_to_cover = max(0.0, -float(current_position))
+        return max(0.0, float(qty) - short_to_cover)
 
-    def _opening_short_qty(self, current_position: int, qty: int) -> int:
-        long_to_close = max(0, int(current_position))
-        return max(0, int(qty) - long_to_close)
+    def _opening_short_qty(self, current_position: float, qty: float) -> float:
+        long_to_close = max(0.0, float(current_position))
+        return max(0.0, float(qty) - long_to_close)
 
     def _reservation_cost(
         self,
         *,
         side: str,
-        current_position: int,
-        qty: int,
+        current_position: float,
+        qty: float,
         limit_price: float,
         reference_price: float,
     ) -> float:
@@ -251,11 +251,16 @@ class MultiAssetBacktester:
         )
 
     def _apply_trade(
-        self, timestamp: pd.Timestamp, symbol: str, signal: int, qty: int, price: float
+        self,
+        timestamp: pd.Timestamp,
+        symbol: str,
+        signal: int,
+        qty: float,
+        price: float,
     ) -> None:
         if qty <= 0 or price <= 0:
             return
-        current = int(self.position_by_symbol.get(symbol, 0))
+        current = float(self.position_by_symbol.get(symbol, 0.0))
         side = "buy" if signal > 0 else "sell"
 
         eligible, reason = evaluate_asset_eligibility(
@@ -278,13 +283,14 @@ class MultiAssetBacktester:
             )
             return
 
-        if side == "buy" and current > 0:
-            return
-        if side == "sell" and current < 0:
-            return
+        if self.portfolio_strategy is None:
+            if side == "buy" and current > 0:
+                return
+            if side == "sell" and current < 0:
+                return
 
         if self.max_notional_per_order is not None:
-            max_qty = int(self.max_notional_per_order / price)
+            max_qty = float(self.max_notional_per_order) / float(price)
             qty = min(qty, max_qty)
         if qty <= 0:
             return
@@ -293,7 +299,7 @@ class MultiAssetBacktester:
             affordable_cash = self.cash
             if self.paper_parity.enabled and self.paper_parity.reserve_open_orders:
                 affordable_cash -= self._batch_reserved_buying_power
-            affordable = int(max(0.0, affordable_cash) / price)
+            affordable = float(max(0.0, affordable_cash) / float(price))
             qty = min(qty, affordable)
             if qty <= 0:
                 if self.paper_parity.enabled and self.paper_parity.reserve_open_orders:
@@ -337,7 +343,7 @@ class MultiAssetBacktester:
                 if projected_short_notional > float(self.max_short_notional):
                     return
 
-            opening_short_qty = max(0, qty - max(0, current))
+            opening_short_qty = max(0.0, float(qty) - max(0.0, float(current)))
             if opening_short_qty > 0 and self.paper_parity.enabled:
                 reference_price = self.latest_price_by_symbol.get(symbol, price)
                 if reference_price is None or reference_price <= 0:
@@ -463,7 +469,7 @@ class MultiAssetBacktester:
                                 continue
 
                             qty_val = row.get("target_qty", 0)
-                            qty = int(qty_val) if pd.notna(qty_val) else 0
+                            qty = float(qty_val) if pd.notna(qty_val) else 0.0
                             if qty <= 0:
                                 continue
 
@@ -511,7 +517,7 @@ class MultiAssetBacktester:
                         continue
 
                     qty_val = row.get("target_qty", 0)
-                    qty = int(qty_val) if pd.notna(qty_val) else 0
+                    qty = float(qty_val) if pd.notna(qty_val) else 0.0
                     if qty <= 0:
                         continue
 
