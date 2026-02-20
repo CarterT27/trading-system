@@ -12,6 +12,7 @@ from core.gateway import MarketDataGateway
 from core.matching_engine import MatchingEngine
 from core.order_book import Order, OrderBook
 from core.order_manager import OrderLoggingGateway, OrderManager
+from core.paper_parity import PaperParityConfig, normalize_paper_parity_config
 from strategies import MovingAverageStrategy, Strategy
 
 DATA_DIR = Path("data")
@@ -43,6 +44,7 @@ class Backtester:
         logger: Optional[OrderLoggingGateway] = None,
         default_position_size: int = 10,
         verbose: bool = True,
+        paper_parity: Optional[PaperParityConfig] = None,
     ):
         self.data_gateway = data_gateway
         self.strategy = strategy
@@ -52,6 +54,7 @@ class Backtester:
         self.logger = logger
         self.default_position_size = default_position_size
         self.verbose = verbose
+        self.paper_parity = normalize_paper_parity_config(paper_parity)
 
         self.market_history: List[Dict] = []
         self.equity_curve: List[float] = []
