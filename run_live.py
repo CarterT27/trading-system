@@ -27,6 +27,7 @@ Logs are saved to: logs/trades.csv, logs/signals.csv, logs/system.log
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import time
@@ -598,6 +599,7 @@ def main() -> None:
         )
 
     trade_logger = get_trade_logger()
+    session_started_at = datetime.now(timezone.utc)
 
     if multi_asset_mode and not args.skip_preload:
         try:
@@ -643,7 +645,10 @@ def main() -> None:
                 clean_market_data(raw_path)
 
     def print_summary() -> None:
-        summary = trade_logger.get_session_summary(start_equity)
+        summary = trade_logger.get_session_summary(
+            start_equity=start_equity,
+            session_started_at=session_started_at,
+        )
         logger.info("")
         logger.info("=" * 60)
         logger.info("                    SESSION SUMMARY")

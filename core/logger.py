@@ -10,7 +10,7 @@ import csv
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -224,11 +224,31 @@ class TradeLogger:
             trades = trades[-limit:]
         return trades
 
-    def get_session_summary(self, start_equity: float) -> Dict[str, Any]:
+    def get_session_summary(
+        self,
+        start_equity: float,
+        session_started_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
         """Generate a comprehensive summary of the current trading session."""
         import numpy as np
 
         trades = self.get_trades()
+        if session_started_at is not None:
+            cutoff = session_started_at
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=timezone.utc)
+            filtered_trades = []
+            for t in trades:
+                ts_raw = str(t.get("timestamp", "")).strip()
+                if not ts_raw:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if ts >= cutoff:
+                    filtered_trades.append(t)
+            trades = filtered_trades
 
         empty_result = {
             "total_trades": 0,

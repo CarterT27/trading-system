@@ -104,6 +104,9 @@ class AlpacaTrader:
         self.api = api or get_rest()
         self.trade_logger = get_trade_logger()
         self.starting_equity = self._get_equity()
+        self.sim_cash = self.starting_equity
+        self.sim_position_qty = 0.0
+        self.sim_last_price = 0.0
 
         logger.info(
             f"Initialized trader: {self.display_symbol} | strategy={self.strategy_name} | equity=${self.starting_equity:,.2f}"
@@ -114,6 +117,8 @@ class AlpacaTrader:
         return float(account.equity)
 
     def _get_net_position(self) -> float:
+        if self.dry_run:
+            return float(self.sim_position_qty)
         try:
             position = self.api.get_position(self.symbol)
         except APIError as exc:
@@ -127,6 +132,8 @@ class AlpacaTrader:
         return qty
 
     def _has_open_order(self) -> bool:
+        if self.dry_run:
+            return False
         orders = self.api.list_orders(status="open", symbols=[self.symbol])
         return len(orders) > 0
 
@@ -285,13 +292,27 @@ class AlpacaTrader:
         )
         return order.id
 
+    def _mark_to_market_equity(self, mark_price: Optional[float] = None) -> float:
+        effective_price = float(mark_price) if mark_price is not None else self.sim_last_price
+        return float(self.sim_cash + self.sim_position_qty * effective_price)
+
+    def _apply_simulated_fill(self, decision: TradeDecision, qty: float, fill_price: float) -> float:
+        signed_qty = qty if decision.side == "buy" else -qty
+        self.sim_position_qty += signed_qty
+        self.sim_cash -= signed_qty * fill_price
+        self.sim_last_price = float(fill_price)
+        return self._mark_to_market_equity(mark_price=fill_price)
+
     def _print_trade(self, decision: TradeDecision, qty: float, order_id: str) -> None:
-        equity = self._get_equity()
-        net_pnl = equity - self.starting_equity
-        qty_display = self._format_qty(qty)
         print_price = (
             decision.limit_price if decision.order_type == "limit" else decision.price
         )
+        if self.dry_run:
+            equity = self._apply_simulated_fill(decision, qty, print_price)
+        else:
+            equity = self._get_equity()
+        net_pnl = equity - self.starting_equity
+        qty_display = self._format_qty(qty)
         price_display = f"{print_price:.2f}" if print_price else "market"
 
         # Log to file

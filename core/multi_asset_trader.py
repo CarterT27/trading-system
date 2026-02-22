@@ -158,6 +158,9 @@ class MultiAssetAlpacaTrader:
         self.buying_power_cooldown_until: Dict[str, int] = {}
         self.starting_equity = self._get_equity()
         self.latest_equity = self.starting_equity
+        self.sim_cash = self.starting_equity
+        self.sim_positions: Dict[str, float] = {symbol: 0.0 for symbol in self.symbols}
+        self.sim_last_price_by_symbol: Dict[str, float] = {}
 
         logger.info(
             "Initialized multi-asset trader: asset_class=%s symbols=%s timeframe=%s lookback=%s dry_run=%s portfolio_mode=%s",
@@ -392,6 +395,8 @@ class MultiAssetAlpacaTrader:
     # ---------------------------------------------------------------- decision
 
     def _list_position_map(self) -> Dict[str, float]:
+        if self.dry_run:
+            return dict(self.sim_positions)
         positions = self._api_call(self.api.list_positions)
         out: Dict[str, float] = {}
         for pos in positions:
@@ -406,6 +411,8 @@ class MultiAssetAlpacaTrader:
         return out
 
     def _list_open_order_symbols(self) -> set[str]:
+        if self.dry_run:
+            return set()
         orders = self._api_call(self.api.list_orders, status="open")
         out: set[str] = set()
         for order in orders:
@@ -575,6 +582,37 @@ class MultiAssetAlpacaTrader:
             return float(decision.limit_price)
         return float(decision.price)
 
+    def _update_sim_mark_prices(self, panel: pd.DataFrame) -> None:
+        if panel.empty:
+            return
+        latest_rows = panel.sort_values("Datetime").groupby("symbol").tail(1)
+        for _, row in latest_rows.iterrows():
+            symbol = str(row.get("symbol", "")).upper()
+            close_value = row.get("Close", None)
+            if not symbol or close_value is None or pd.isna(close_value):
+                continue
+            price = float(close_value)
+            if price > 0:
+                self.sim_last_price_by_symbol[symbol] = price
+
+    def _mark_to_market_equity(self) -> float:
+        position_value = 0.0
+        for symbol, qty in self.sim_positions.items():
+            mark_price = self.sim_last_price_by_symbol.get(symbol)
+            if mark_price is None:
+                continue
+            position_value += float(qty) * float(mark_price)
+        return float(self.sim_cash + position_value)
+
+    def _apply_simulated_fill(self, decision: MultiTradeDecision, fill_price: float) -> None:
+        signed_qty = decision.qty if decision.side == "buy" else -decision.qty
+        self.sim_positions[decision.symbol] = (
+            float(self.sim_positions.get(decision.symbol, 0.0)) + signed_qty
+        )
+        self.sim_cash -= signed_qty * fill_price
+        self.sim_last_price_by_symbol[decision.symbol] = float(fill_price)
+        self.latest_equity = self._mark_to_market_equity()
+
     def _cap_qty_for_buying_power(
         self,
         decision: MultiTradeDecision,
@@ -642,6 +680,8 @@ class MultiAssetAlpacaTrader:
             return panel
 
         self._merge_history(panel)
+        if self.dry_run:
+            self._update_sim_mark_prices(panel)
         open_order_symbols = self._list_open_order_symbols()
         position_map = self._list_position_map()
 
@@ -722,13 +762,19 @@ class MultiAssetAlpacaTrader:
             decisions = decisions[: self.max_orders_per_cycle]
 
         remaining_buying_power = 0.0
-        try:
-            self.latest_equity, buying_power = self._get_account_snapshot()
+        if self.dry_run:
+            self.latest_equity = self._mark_to_market_equity()
             remaining_buying_power = max(
-                0.0, buying_power * (1.0 - self.buying_power_buffer)
+                0.0, float(self.sim_cash) * (1.0 - self.buying_power_buffer)
             )
-        except Exception:
-            pass
+        else:
+            try:
+                self.latest_equity, buying_power = self._get_account_snapshot()
+                remaining_buying_power = max(
+                    0.0, buying_power * (1.0 - self.buying_power_buffer)
+                )
+            except Exception:
+                pass
 
         working_position_map = dict(position_map)
         for decision in decisions:
@@ -827,6 +873,8 @@ class MultiAssetAlpacaTrader:
                 if order_decision.limit_price is not None
                 else order_decision.price
             )
+            if self.dry_run:
+                self._apply_simulated_fill(order_decision, print_price)
             net_pnl = self.latest_equity - self.starting_equity
             self.trade_logger.log_trade(
                 symbol=order_decision.symbol,
