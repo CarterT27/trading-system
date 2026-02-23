@@ -313,7 +313,15 @@ class MultiAssetAlpacaTrader:
 
             if not panel_parts:
                 return pd.DataFrame(
-                    columns=["Datetime", "symbol", "Open", "High", "Low", "Close", "Volume"]
+                    columns=[
+                        "Datetime",
+                        "symbol",
+                        "Open",
+                        "High",
+                        "Low",
+                        "Close",
+                        "Volume",
+                    ]
                 )
             panel = pd.concat(panel_parts, ignore_index=True)
             panel = panel.sort_values(["Datetime", "symbol"]).drop_duplicates(
@@ -574,7 +582,29 @@ class MultiAssetAlpacaTrader:
 
     @staticmethod
     def _is_insufficient_buying_power_error(exc: Exception) -> bool:
-        return "insufficient buying power" in str(exc).lower()
+        text = str(exc).lower()
+        return (
+            "insufficient buying power" in text
+            or "insufficient balance" in text
+            or "insufficient funds" in text
+        )
+
+    @staticmethod
+    def _extract_requested_available_balance(
+        exc: Exception,
+    ) -> tuple[Optional[float], Optional[float]]:
+        text = str(exc)
+        match = re.search(
+            r"requested:\s*([0-9]+(?:\.[0-9]+)?),\s*available:\s*([0-9]+(?:\.[0-9]+)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None, None
+        try:
+            return float(match.group(1)), float(match.group(2))
+        except (TypeError, ValueError):
+            return None, None
 
     @staticmethod
     def _effective_price(decision: MultiTradeDecision) -> float:
@@ -604,7 +634,9 @@ class MultiAssetAlpacaTrader:
             position_value += float(qty) * float(mark_price)
         return float(self.sim_cash + position_value)
 
-    def _apply_simulated_fill(self, decision: MultiTradeDecision, fill_price: float) -> None:
+    def _apply_simulated_fill(
+        self, decision: MultiTradeDecision, fill_price: float
+    ) -> None:
         signed_qty = decision.qty if decision.side == "buy" else -decision.qty
         self.sim_positions[decision.symbol] = (
             float(self.sim_positions.get(decision.symbol, 0.0)) + signed_qty
@@ -632,7 +664,9 @@ class MultiAssetAlpacaTrader:
         if self.asset_class == "stock":
             affordable_incremental = float(int(affordable_incremental))
         else:
-            affordable_incremental = np.floor(affordable_incremental * 1_000_000.0) / 1_000_000.0
+            affordable_incremental = (
+                np.floor(affordable_incremental * 1_000_000.0) / 1_000_000.0
+            )
         if decision.side == "buy":
             flatten_qty = min(qty, max(0.0, -position_qty))
         else:
@@ -800,11 +834,21 @@ class MultiAssetAlpacaTrader:
                 )
                 continue
             if adjusted_qty != decision.qty:
+                side_label = str(decision.side).lower()
                 logger.debug(
-                    "Adjusted %s sell qty from %s to %s based on live position.",
+                    "Adjusted %s %s qty from %s to %s based on account constraints.",
                     decision.symbol,
-                    (f"{decision.qty:.6f}".rstrip("0").rstrip(".") if self.asset_class == "crypto" else int(decision.qty)),
-                    (f"{adjusted_qty:.6f}".rstrip("0").rstrip(".") if self.asset_class == "crypto" else int(adjusted_qty)),
+                    side_label,
+                    (
+                        f"{decision.qty:.6f}".rstrip("0").rstrip(".")
+                        if self.asset_class == "crypto"
+                        else int(decision.qty)
+                    ),
+                    (
+                        f"{adjusted_qty:.6f}".rstrip("0").rstrip(".")
+                        if self.asset_class == "crypto"
+                        else int(adjusted_qty)
+                    ),
                 )
             order_decision = replace(decision, qty=adjusted_qty)
 
@@ -821,7 +865,9 @@ class MultiAssetAlpacaTrader:
                     if self.asset_class == "stock":
                         retry_qty = float(int(available_qty))
                     else:
-                        retry_qty = np.floor(float(available_qty) * 1_000_000.0) / 1_000_000.0
+                        retry_qty = (
+                            np.floor(float(available_qty) * 1_000_000.0) / 1_000_000.0
+                        )
                     retry_decision = replace(order_decision, qty=retry_qty)
                     logger.warning(
                         "Order rejected for %s with qty=%s; retrying with available qty=%s",
@@ -848,7 +894,60 @@ class MultiAssetAlpacaTrader:
                         )
                         continue
                 else:
-                    if self._is_insufficient_buying_power_error(exc):
+                    retry_submitted = False
+                    if (
+                        order_decision.side == "buy"
+                        and self._is_insufficient_buying_power_error(exc)
+                    ):
+                        requested_balance, available_balance = (
+                            self._extract_requested_available_balance(exc)
+                        )
+                        effective_price = self._effective_price(order_decision)
+                        if (
+                            effective_price > 0
+                            and available_balance is not None
+                            and available_balance > 0
+                        ):
+                            retry_qty = float(available_balance) / float(
+                                effective_price
+                            )
+                            if self.asset_class == "stock":
+                                retry_qty = float(int(retry_qty))
+                            else:
+                                retry_qty = (
+                                    np.floor(float(retry_qty) * 1_000_000.0)
+                                    / 1_000_000.0
+                                )
+                            if 0 < retry_qty < float(order_decision.qty):
+                                retry_decision = replace(order_decision, qty=retry_qty)
+                                logger.warning(
+                                    "Order rejected for %s due to insufficient balance (requested=%s available=%s); retrying with qty=%s",
+                                    retry_decision.symbol,
+                                    (
+                                        f"{requested_balance:.2f}"
+                                        if requested_balance is not None
+                                        else "?"
+                                    ),
+                                    (
+                                        f"{available_balance:.2f}"
+                                        if available_balance is not None
+                                        else "?"
+                                    ),
+                                    (
+                                        f"{retry_qty:.6f}".rstrip("0").rstrip(".")
+                                        if self.asset_class == "crypto"
+                                        else int(retry_qty)
+                                    ),
+                                )
+                                try:
+                                    order_id = self._submit_order(retry_decision)
+                                    order_decision = retry_decision
+                                    retry_submitted = True
+                                except APIError:
+                                    pass
+                    if retry_submitted:
+                        pass
+                    elif self._is_insufficient_buying_power_error(exc):
                         self.buying_power_cooldown_until[order_decision.symbol] = (
                             self.iteration_count + self.buying_power_cooldown_cycles
                         )
@@ -863,10 +962,11 @@ class MultiAssetAlpacaTrader:
                             remaining_buying_power - reserved_buying_power,
                         )
                         continue
-                    logger.warning(
-                        "Order rejected for %s: %s", order_decision.symbol, exc
-                    )
-                    continue
+                    elif not retry_submitted:
+                        logger.warning(
+                            "Order rejected for %s: %s", order_decision.symbol, exc
+                        )
+                        continue
 
             print_price = (
                 order_decision.limit_price

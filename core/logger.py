@@ -228,11 +228,16 @@ class TradeLogger:
         self,
         start_equity: float,
         session_started_at: Optional[datetime] = None,
+        start_trade_count: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Generate a comprehensive summary of the current trading session."""
         import numpy as np
 
         trades = self.get_trades()
+        if start_trade_count is not None:
+            offset = max(0, int(start_trade_count))
+            if offset > 0:
+                trades = trades[offset:]
         if session_started_at is not None:
             cutoff = session_started_at
             if cutoff.tzinfo is None:

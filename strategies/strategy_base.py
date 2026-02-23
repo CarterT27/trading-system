@@ -213,7 +213,9 @@ class MovingAverageStrategy(Strategy):
         if self._inc_prev_short_ma is not None and self._inc_prev_long_ma is not None:
             if self._inc_prev_short_ma <= self._inc_prev_long_ma and short_ma > long_ma:
                 signal = 1
-            elif self._inc_prev_short_ma >= self._inc_prev_long_ma and short_ma < long_ma:
+            elif (
+                self._inc_prev_short_ma >= self._inc_prev_long_ma and short_ma < long_ma
+            ):
                 signal = -1
 
         position = 0
@@ -381,13 +383,17 @@ class CryptoTrendStrategy(Strategy):
             self._inc_ema_fast = close
         else:
             alpha_fast = 2.0 / (float(self.short_window) + 1.0)
-            self._inc_ema_fast = alpha_fast * close + (1.0 - alpha_fast) * self._inc_ema_fast
+            self._inc_ema_fast = (
+                alpha_fast * close + (1.0 - alpha_fast) * self._inc_ema_fast
+            )
 
         if self._inc_ema_slow is None:
             self._inc_ema_slow = close
         else:
             alpha_slow = 2.0 / (float(self.long_window) + 1.0)
-            self._inc_ema_slow = alpha_slow * close + (1.0 - alpha_slow) * self._inc_ema_slow
+            self._inc_ema_slow = (
+                alpha_slow * close + (1.0 - alpha_slow) * self._inc_ema_slow
+            )
 
         long_regime = bool(self._inc_ema_fast > self._inc_ema_slow)
         signal = 0
@@ -459,15 +465,19 @@ class CryptoRegimeTrendStrategy(Strategy):
             df["EMA_slow"].pct_change(self.slope_lookback).fillna(0.0)
         )
 
-        returns = df["Close"].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        returns = (
+            df["Close"].pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
         min_vol_samples = max(20, self.volatility_window // 3)
         min_quantile_samples = max(50, self.volatility_window // 2)
         df["realized_vol"] = returns.rolling(
             self.volatility_window, min_periods=min_vol_samples
         ).std()
-        vol_threshold = df["realized_vol"].rolling(
-            self.volatility_window, min_periods=min_quantile_samples
-        ).quantile(self.volatility_quantile)
+        vol_threshold = (
+            df["realized_vol"]
+            .rolling(self.volatility_window, min_periods=min_quantile_samples)
+            .quantile(self.volatility_quantile)
+        )
         # Shift threshold by one bar so the gate is strictly causal.
         df["vol_gate_threshold"] = vol_threshold.shift(1)
         return df
@@ -646,7 +656,7 @@ class CryptoCompetitionStrategy(Strategy):
         self._meta_cache_index: pd.Index | None = None
         self._meta_cache_probs: np.ndarray = np.array([], dtype=float)
         self._meta_cache_bundle: dict[str, object] | None = None
-        self._meta_cache_last_refit_bar: int = -10**9
+        self._meta_cache_last_refit_bar: int = -(10**9)
 
     def _reset_incremental_runtime(self) -> None:
         self._inc_bar_count = 0
@@ -669,7 +679,7 @@ class CryptoCompetitionStrategy(Strategy):
             meta_cap = min(meta_cap, int(self.meta_train_window))
         self._inc_meta_max_rows = max(2, meta_cap + 1)
         self._inc_meta_bundle: dict[str, object] | None = None
-        self._inc_meta_last_refit_bar: int = -10**9
+        self._inc_meta_last_refit_bar: int = -(10**9)
         self._inc_meta_state = False
 
         self._inc_size_ewm: float | None = None
@@ -721,8 +731,8 @@ class CryptoCompetitionStrategy(Strategy):
             df["Close"].pct_change(30).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         )
         # Keep NaN at the end so unknown future labels are excluded from training.
-        df["fwd_ret"] = df["Close"].pct_change().shift(-1).replace(
-            [np.inf, -np.inf], np.nan
+        df["fwd_ret"] = (
+            df["Close"].pct_change().shift(-1).replace([np.inf, -np.inf], np.nan)
         )
 
         df["EMA_fast"] = df["Close"].ewm(span=self.short_window, adjust=False).mean()
@@ -733,9 +743,11 @@ class CryptoCompetitionStrategy(Strategy):
 
         min_vol_samples = max(20, self.volatility_window // 3)
         min_q_samples = max(50, self.volatility_window // 2)
-        df["realized_vol"] = df["ret1"].rolling(
-            self.volatility_window, min_periods=min_vol_samples
-        ).std()
+        df["realized_vol"] = (
+            df["ret1"]
+            .rolling(self.volatility_window, min_periods=min_vol_samples)
+            .std()
+        )
         vol_threshold = (
             df["realized_vol"]
             .rolling(self.volatility_window, min_periods=min_q_samples)
@@ -762,9 +774,9 @@ class CryptoCompetitionStrategy(Strategy):
             (df["EMA_fast"] - df["EMA_slow"]).abs()
             / (df["Close"] * df["realized_vol"] + 1e-12)
         ).replace([np.inf, -np.inf], np.nan)
-        df["vol_ratio"] = (df["realized_vol"] / (df["vol_gate_threshold"] + 1e-12)).replace(
-            [np.inf, -np.inf], np.nan
-        )
+        df["vol_ratio"] = (
+            df["realized_vol"] / (df["vol_gate_threshold"] + 1e-12)
+        ).replace([np.inf, -np.inf], np.nan)
 
         df["trend_pre"] = (df["EMA_fast"] > df["EMA_slow"]).fillna(False)
         df["base_long"] = (
@@ -934,12 +946,16 @@ class CryptoCompetitionStrategy(Strategy):
             "const_prob": positive_rate,
         }
 
-    def _predict_meta_bundle(self, X_row: np.ndarray, bundle: dict[str, object]) -> float:
+    def _predict_meta_bundle(
+        self, X_row: np.ndarray, bundle: dict[str, object]
+    ) -> float:
         models = bundle.get("models", [])
         if not isinstance(models, list) or not models:
             return float(bundle.get("const_prob", 0.5))
 
-        weights = np.asarray(bundle.get("weights", np.array([], dtype=float)), dtype=float)
+        weights = np.asarray(
+            bundle.get("weights", np.array([], dtype=float)), dtype=float
+        )
         if len(weights) != len(models) or float(weights.sum()) <= 0:
             weights = np.ones(len(models), dtype=float) / float(len(models))
 
@@ -967,7 +983,9 @@ class CryptoCompetitionStrategy(Strategy):
             return probs
 
         # Fast path: identical index means we can return cached probabilities.
-        if self._meta_cache_index is not None and df.index.equals(self._meta_cache_index):
+        if self._meta_cache_index is not None and df.index.equals(
+            self._meta_cache_index
+        ):
             if len(self._meta_cache_probs) == n:
                 return pd.Series(self._meta_cache_probs, index=df.index, dtype=float)
 
@@ -1002,7 +1020,7 @@ class CryptoCompetitionStrategy(Strategy):
             probs_np = np.full(n, 0.5, dtype=float)
             start_i = 0
             bundle = None
-            last_refit = -10**9
+            last_refit = -(10**9)
 
         for i in range(start_i, n):
             if bundle is None or (i - last_refit) >= self.meta_refit_interval:
@@ -1013,9 +1031,10 @@ class CryptoCompetitionStrategy(Strategy):
                 if len(train_block):
                     valid_train = (
                         train_block["trend_pre"].astype(bool)
-                        & train_block[list(self.META_FEATURE_COLS)].replace(
-                            [np.inf, -np.inf], np.nan
-                        ).notna().all(axis=1)
+                        & train_block[list(self.META_FEATURE_COLS)]
+                        .replace([np.inf, -np.inf], np.nan)
+                        .notna()
+                        .all(axis=1)
                         & train_block["fwd_ret"].notna()
                     )
                     train_df = train_block.loc[valid_train]
@@ -1057,7 +1076,7 @@ class CryptoCompetitionStrategy(Strategy):
     def _dynamic_size(self, df: pd.DataFrame) -> pd.Series:
         strength = (df["spread_z"] - self.sizing_offset).clip(lower=0.0).fillna(0.0)
         vol_ratio = df["vol_ratio"].clip(lower=0.5, upper=5.0).fillna(1.0)
-        vol_adj = 1.0 / (vol_ratio ** self.sizing_vol_exponent)
+        vol_adj = 1.0 / (vol_ratio**self.sizing_vol_exponent)
         size = (self.sizing_scale * strength * vol_adj).clip(lower=0.0, upper=1.0)
         if self.sizing_smooth_span > 1:
             size = size.ewm(span=self.sizing_smooth_span, adjust=False).mean()
@@ -1141,8 +1160,12 @@ class CryptoCompetitionStrategy(Strategy):
         return pd.Series(out, index=entry_gate.index, dtype=float)
 
     def _hysteresis_meta_gate(self, prob: pd.Series) -> pd.Series:
-        lower = max(1e-6, float(self.meta_prob_threshold) - float(self.meta_no_trade_band))
-        upper = min(1.0 - 1e-6, float(self.meta_prob_threshold) + float(self.meta_no_trade_band))
+        lower = max(
+            1e-6, float(self.meta_prob_threshold) - float(self.meta_no_trade_band)
+        )
+        upper = min(
+            1.0 - 1e-6, float(self.meta_prob_threshold) + float(self.meta_no_trade_band)
+        )
         out = np.zeros(len(prob), dtype=float)
         state = False
         vals = prob.fillna(0.5).astype(float).values
@@ -1159,9 +1182,9 @@ class CryptoCompetitionStrategy(Strategy):
         df["meta_prob"] = self._compute_causal_meta_prob(df)
         df["meta_long"] = self._hysteresis_meta_gate(df["meta_prob"])
 
-        entry_gate = (
-            (df["quality_long"] > 0.0) & (df["meta_long"] > 0.0)
-        ).astype(float)
+        entry_gate = ((df["quality_long"] > 0.0) & (df["meta_long"] > 0.0)).astype(
+            float
+        )
         size = self._dynamic_size(df)
         position_frac = self._position_with_exit_and_size(
             entry_gate=entry_gate,
@@ -1200,7 +1223,11 @@ class CryptoCompetitionStrategy(Strategy):
             }
 
         prev_close = self._inc_prev_close
-        if prev_close is not None and np.isfinite(prev_close) and abs(prev_close) > 1e-12:
+        if (
+            prev_close is not None
+            and np.isfinite(prev_close)
+            and abs(prev_close) > 1e-12
+        ):
             ret1 = float(close / prev_close - 1.0)
             prev_fwd_ret = ret1
         else:
@@ -1223,15 +1250,15 @@ class CryptoCompetitionStrategy(Strategy):
             self._inc_ema_fast = close
         else:
             alpha_fast = 2.0 / (float(self.short_window) + 1.0)
-            self._inc_ema_fast = (
-                alpha_fast * close + (1.0 - alpha_fast) * float(self._inc_ema_fast)
+            self._inc_ema_fast = alpha_fast * close + (1.0 - alpha_fast) * float(
+                self._inc_ema_fast
             )
         if self._inc_ema_slow is None:
             self._inc_ema_slow = close
         else:
             alpha_slow = 2.0 / (float(self.long_window) + 1.0)
-            self._inc_ema_slow = (
-                alpha_slow * close + (1.0 - alpha_slow) * float(self._inc_ema_slow)
+            self._inc_ema_slow = alpha_slow * close + (1.0 - alpha_slow) * float(
+                self._inc_ema_slow
             )
 
         ema_fast = float(self._inc_ema_fast)
@@ -1250,7 +1277,8 @@ class CryptoCompetitionStrategy(Strategy):
         min_vol_samples = max(20, int(self.volatility_window) // 3)
         min_q_samples = max(50, int(self.volatility_window) // 2)
         ret1_arr = np.asarray(
-            [float(x) for x in self._inc_ret1_window if np.isfinite(float(x))], dtype=float
+            [float(x) for x in self._inc_ret1_window if np.isfinite(float(x))],
+            dtype=float,
         )
         if len(ret1_arr) >= min_vol_samples and len(ret1_arr) > 1:
             realized_vol = float(np.std(ret1_arr, ddof=1))
@@ -1280,11 +1308,16 @@ class CryptoCompetitionStrategy(Strategy):
             spread = float("nan")
         self._inc_spread_window.append(spread)
         spread_arr = np.asarray(
-            [float(x) for x in self._inc_spread_window if np.isfinite(float(x))], dtype=float
+            [float(x) for x in self._inc_spread_window if np.isfinite(float(x))],
+            dtype=float,
         )
         if len(spread_arr) >= 100 and np.isfinite(spread):
             spread_mean = float(np.mean(spread_arr))
-            spread_std = float(np.std(spread_arr, ddof=1)) if len(spread_arr) > 1 else float("nan")
+            spread_std = (
+                float(np.std(spread_arr, ddof=1))
+                if len(spread_arr) > 1
+                else float("nan")
+            )
             if np.isfinite(spread_std):
                 spread_z = float((spread - spread_mean) / (spread_std + 1e-12))
             else:
@@ -1293,7 +1326,9 @@ class CryptoCompetitionStrategy(Strategy):
             spread_z = float("nan")
 
         if np.isfinite(realized_vol):
-            trend_tstat = float(abs(ema_fast - ema_slow) / (close * realized_vol + 1e-12))
+            trend_tstat = float(
+                abs(ema_fast - ema_slow) / (close * realized_vol + 1e-12)
+            )
         else:
             trend_tstat = float("nan")
 
@@ -1363,7 +1398,8 @@ class CryptoCompetitionStrategy(Strategy):
             self._inc_meta_last_refit_bar = i
 
         row_vec = np.asarray(
-            [current_meta_row.get(col, np.nan) for col in self.META_FEATURE_COLS], dtype=float
+            [current_meta_row.get(col, np.nan) for col in self.META_FEATURE_COLS],
+            dtype=float,
         )
         row_vec = np.clip(np.nan_to_num(row_vec, nan=0.0), -50.0, 50.0).reshape(1, -1)
         if self._inc_meta_bundle is None:
@@ -1394,7 +1430,9 @@ class CryptoCompetitionStrategy(Strategy):
         vr = float(np.clip(vol_ratio, 0.5, 5.0)) if np.isfinite(vol_ratio) else 1.0
         size_raw = float(
             np.clip(
-                float(self.sizing_scale) * strength / (vr ** float(self.sizing_vol_exponent)),
+                float(self.sizing_scale)
+                * strength
+                / (vr ** float(self.sizing_vol_exponent)),
                 0.0,
                 1.0,
             )
@@ -1510,16 +1548,24 @@ class CryptoCompetitionPortfolioStrategy(CrossSectionalStrategy):
         portfolio_notional: float = 100_000.0,
         allow_fractional_qty: bool = True,
         min_order_notional: float = 5.0,
+        min_active_symbols: int = 3,
+        max_symbol_weight: float = 0.35,
         **competition_kwargs,
     ):
         if portfolio_notional <= 0:
             raise ValueError("portfolio_notional must be positive.")
         if min_order_notional < 0:
             raise ValueError("min_order_notional must be non-negative.")
+        if min_active_symbols < 1:
+            raise ValueError("min_active_symbols must be at least 1.")
+        if max_symbol_weight <= 0.0 or max_symbol_weight > 1.0:
+            raise ValueError("max_symbol_weight must be in (0, 1].")
 
         self.portfolio_notional = float(portfolio_notional)
         self.allow_fractional_qty = bool(allow_fractional_qty)
         self.min_order_notional = float(min_order_notional)
+        self.min_active_symbols = int(min_active_symbols)
+        self.max_symbol_weight = float(max_symbol_weight)
 
         # Use per-symbol position_size=1 so desired_position_frac remains the
         # sizing driver, while portfolio wrapper controls gross notional.
@@ -1604,6 +1650,11 @@ class CryptoCompetitionPortfolioStrategy(CrossSectionalStrategy):
 
         desired_frac_by_symbol: dict[str, float] = {}
         close_by_symbol: dict[str, float] = {}
+        pos_map = {
+            str(k).upper(): float(v)
+            for k, v in (current_positions or {}).items()
+            if pd.notna(v)
+        }
 
         for symbol, sym_df in panel.groupby("symbol"):
             sym = str(symbol).upper()
@@ -1612,7 +1663,9 @@ class CryptoCompetitionPortfolioStrategy(CrossSectionalStrategy):
                 continue
 
             strategy = self._strategy_for_symbol(sym)
-            out = strategy.run(local[["Datetime", "Open", "High", "Low", "Close", "Volume"]])
+            out = strategy.run(
+                local[["Datetime", "Open", "High", "Low", "Close", "Volume"]]
+            )
             if out.empty:
                 continue
 
@@ -1635,18 +1688,54 @@ class CryptoCompetitionPortfolioStrategy(CrossSectionalStrategy):
             return empty
 
         active_symbols = sorted(desired_frac_by_symbol.keys())
-        per_symbol_budget = float(self.portfolio_notional) / float(len(active_symbols))
+        if len(active_symbols) < self.min_active_symbols:
+            latest_close_by_symbol = (
+                panel.sort_values("Datetime")
+                .groupby("symbol")
+                .tail(1)
+                .set_index("symbol")["Close"]
+            )
+            rows: list[dict[str, float | int | str]] = []
+            for sym, current_qty in pos_map.items():
+                if current_qty <= 0:
+                    continue
+                close = float(latest_close_by_symbol.get(sym, np.nan))
+                if not np.isfinite(close) or close <= 0:
+                    continue
+                current_notional = float(current_qty) * float(close)
+                if current_notional < float(self.min_order_notional):
+                    continue
+                qty = self._qty_from_notional_delta(current_notional, close)
+                qty = min(qty, float(max(0.0, current_qty)))
+                if qty <= 0:
+                    continue
+                rows.append(
+                    {
+                        "symbol": sym,
+                        "signal": -1,
+                        "target_qty": float(qty),
+                        "limit_price": float(close),
+                    }
+                )
+            if not rows:
+                return empty
+            out = pd.DataFrame(rows)
+            out = out.dropna(subset=["symbol", "signal", "target_qty"])
+            out["signal"] = out["signal"].astype(int)
+            out["target_qty"] = out["target_qty"].astype(float)
+            out = out[out["target_qty"] > 0]
+            return out[["symbol", "signal", "target_qty", "limit_price"]]
 
-        pos_map = {
-            str(k).upper(): float(v)
-            for k, v in (current_positions or {}).items()
-            if pd.notna(v)
-        }
+        per_symbol_budget = float(self.portfolio_notional) / float(len(active_symbols))
+        symbol_notional_cap = float(self.portfolio_notional) * float(
+            self.max_symbol_weight
+        )
 
         rows: list[dict[str, float | int | str]] = []
         for sym in active_symbols:
             close = float(close_by_symbol[sym])
             target_notional = float(desired_frac_by_symbol[sym]) * per_symbol_budget
+            target_notional = min(target_notional, symbol_notional_cap)
             current_qty = float(pos_map.get(sym, 0.0))
             current_notional = current_qty * close
             delta_notional = target_notional - current_notional

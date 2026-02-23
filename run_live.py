@@ -196,6 +196,18 @@ Examples:
         help="Minimum notional delta required for portfolio rebalance orders.",
     )
     parser.add_argument(
+        "--portfolio-min-active-symbols",
+        type=int,
+        default=3,
+        help="Minimum active symbols required before opening new portfolio exposure (default: 3).",
+    )
+    parser.add_argument(
+        "--portfolio-max-symbol-weight",
+        type=float,
+        default=0.35,
+        help="Maximum notional weight per symbol in portfolio mode, in [0,1] (default: 0.35).",
+    )
+    parser.add_argument(
         "--portfolio-fractional-qty",
         dest="portfolio_fractional_qty",
         action="store_true",
@@ -448,6 +460,8 @@ def build_strategy(strategy_cls, args: argparse.Namespace):
             portfolio_notional=args.portfolio_notional,
             allow_fractional_qty=bool(args.portfolio_fractional_qty),
             min_order_notional=args.portfolio_min_order_notional,
+            min_active_symbols=args.portfolio_min_active_symbols,
+            max_symbol_weight=args.portfolio_max_symbol_weight,
             meta_no_trade_band=args.meta_no_trade_band,
             meta_use_xgboost=bool(args.meta_use_xgboost),
             meta_prob_threshold=args.meta_prob_threshold,
@@ -600,6 +614,7 @@ def main() -> None:
 
     trade_logger = get_trade_logger()
     session_started_at = datetime.now(timezone.utc)
+    baseline_trade_count = len(trade_logger.get_trades())
 
     if multi_asset_mode and not args.skip_preload:
         try:
@@ -630,7 +645,9 @@ def main() -> None:
             if multi_asset_mode:
                 out_dir = Path("data")
                 out_dir.mkdir(parents=True, exist_ok=True)
-                raw_path = out_dir / f"MULTI_{args.timeframe}_{args.asset_class}_live_raw.csv"
+                raw_path = (
+                    out_dir / f"MULTI_{args.timeframe}_{args.asset_class}_live_raw.csv"
+                )
                 frame = df.copy()
                 if "Datetime" in frame.columns:
                     frame["Datetime"] = pd.to_datetime(
@@ -648,6 +665,7 @@ def main() -> None:
         summary = trade_logger.get_session_summary(
             start_equity=start_equity,
             session_started_at=session_started_at,
+            start_trade_count=baseline_trade_count,
         )
         logger.info("")
         logger.info("=" * 60)
